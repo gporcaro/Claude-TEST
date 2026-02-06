@@ -45,9 +45,7 @@ class Agent:
     async def run(self, messages: list[dict], user_id: str = "unknown") -> str:
         """Run the agent tool loop and return the final text response."""
         # Build messages for Claude (only role + content)
-        claude_messages = [
-            {"role": m["role"], "content": m["content"]} for m in messages
-        ]
+        claude_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
         for loop_idx in range(self.max_loops):
             logger.debug("Agent loop %d, sending %d messages", loop_idx, len(claude_messages))
@@ -67,24 +65,26 @@ class Agent:
             # If the model wants to use tools, execute them
             if response.stop_reason == "tool_use":
                 # Add the assistant message with all content blocks
-                claude_messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
+                claude_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": response.content,
+                    }
+                )
 
                 # Execute each tool call and build tool results
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
                         logger.info("Executing tool: %s(%s)", block.name, json.dumps(block.input))
-                        result = await execute_tool(
-                            block.name, block.input, self.settings, user_id
+                        result = await execute_tool(block.name, block.input, self.settings, user_id)
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result,
+                            }
                         )
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        })
 
                 claude_messages.append({"role": "user", "content": tool_results})
             else:

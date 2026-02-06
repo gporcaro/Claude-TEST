@@ -29,7 +29,12 @@ async def ping_host(host: str, count: int = 4, **_) -> dict:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ping", "-c", str(count), "-W", "5", host,
+            "ping",
+            "-c",
+            str(count),
+            "-W",
+            "5",
+            host,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -57,7 +62,9 @@ async def dns_lookup(hostname: str, record_type: str = "A", **_) -> dict:
     try:
         # Use nslookup for cross-platform compatibility
         proc = await asyncio.create_subprocess_exec(
-            "nslookup", f"-type={record_type}", hostname,
+            "nslookup",
+            f"-type={record_type}",
+            hostname,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -122,7 +129,9 @@ async def check_service_status(service_name: str, **_) -> dict:
     try:
         # Use pgrep for cross-platform process checking
         proc = await asyncio.create_subprocess_exec(
-            "pgrep", "-f", service_name,
+            "pgrep",
+            "-f",
+            service_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

@@ -5,8 +5,7 @@ TOOLS = [
     {
         "name": "ping_host",
         "description": (
-            "Ping a hostname or IP address to check if it is reachable."
-            " Returns latency info."
+            "Ping a hostname or IP address to check if it is reachable. Returns latency info."
         ),
         "input_schema": {
             "type": "object",
@@ -14,8 +13,7 @@ TOOLS = [
                 "host": {
                     "type": "string",
                     "description": (
-                        "Hostname or IP address to ping"
-                        " (e.g. 'google.com' or '8.8.8.8')"
+                        "Hostname or IP address to ping (e.g. 'google.com' or '8.8.8.8')"
                     ),
                 },
                 "count": {
@@ -30,8 +28,7 @@ TOOLS = [
     {
         "name": "dns_lookup",
         "description": (
-            "Perform a DNS lookup on a hostname."
-            " Returns resolved IP addresses and record info."
+            "Perform a DNS lookup on a hostname. Returns resolved IP addresses and record info."
         ),
         "input_schema": {
             "type": "object",
@@ -74,8 +71,7 @@ TOOLS = [
                 "service_name": {
                     "type": "string",
                     "description": (
-                        "Name of the service or process to check"
-                        " (e.g. 'nginx', 'postgres')"
+                        "Name of the service or process to check (e.g. 'nginx', 'postgres')"
                     ),
                 },
             },

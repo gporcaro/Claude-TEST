@@ -26,15 +26,17 @@ def _split_markdown(text: str, source: str) -> list[dict]:
         lines = section.split("\n", 1)
         title = lines[0].lstrip("#").strip() if lines[0].startswith("#") else ""
 
-        chunks.append({
-            "id": f"{source}::chunk_{i}",
-            "content": section,
-            "metadata": {
-                "source": source,
-                "title": title,
-                "chunk_index": i,
-            },
-        })
+        chunks.append(
+            {
+                "id": f"{source}::chunk_{i}",
+                "content": section,
+                "metadata": {
+                    "source": source,
+                    "title": title,
+                    "chunk_index": i,
+                },
+            }
+        )
     return chunks
 
 
