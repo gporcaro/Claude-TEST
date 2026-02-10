@@ -5,6 +5,7 @@ from google import genai
 from qdrant_client import QdrantClient
 
 from it_agent.bot.app import create_app, start_app
+from it_agent.bot.handlers import discover_incident_channels
 from it_agent.config import get_settings
 from it_agent.kb.indexer import index_knowledge_base
 
@@ -22,6 +23,7 @@ def main() -> None:
 
 async def _start(settings) -> None:
     await _ensure_kb_indexed(settings)
+    await discover_incident_channels(settings)
     app = create_app(settings)
     await start_app(app, settings)
 

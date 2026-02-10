@@ -81,10 +81,11 @@ async def create_ticket(
             f"*Description:* {incident['description']}\n\n"
             f"<{sn_link}|View in ServiceNow>"
         )
-        await slack.chat_postMessage(channel=channel_id, text=message)
+        msg_resp = await slack.chat_postMessage(channel=channel_id, text=message)
 
         result["channel_name"] = channel_name
         result["channel_id"] = channel_id
+        result["summary_ts"] = msg_resp["ts"]
     except Exception:
         logger.warning(
             "Failed to create Slack channel for %s",

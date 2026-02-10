@@ -91,11 +91,13 @@ def _reset_handler_state():
     handlers._conversations.clear()
     handlers._ticket_threads.clear()
     handlers._incident_channels.clear()
+    handlers._incident_context.clear()
     handlers._agent = None
     yield
     handlers._conversations.clear()
     handlers._ticket_threads.clear()
     handlers._incident_channels.clear()
+    handlers._incident_context.clear()
     handlers._agent = None
 
 
@@ -368,7 +370,7 @@ class TestDMNoFollowUp:
 
 class TestIncidentChannelRouting:
     async def test_incident_channel_registered_on_ticket_creation(self):
-        """When a ticket is created, the incident channel_id is registered."""
+        """When a ticket is created, the incident channel_id and context are stored."""
         settings = _make_settings()
         say = AsyncMock()
         mock_agent = AsyncMock()
@@ -378,16 +380,27 @@ class TestIncidentChannelRouting:
             await handlers._handle_message(_dm_event(), "laptop broke", say, settings)
 
         assert "C_INC42" in handlers._incident_channels
+        assert "C_INC42" in handlers._incident_context
+        assert handlers._incident_context["C_INC42"]["ticket_id"] == "INC0010042"
 
     async def test_incident_channel_messages_are_processed(self):
-        """Messages in a registered incident channel go through _handle_message."""
+        """Messages in a registered incident channel go through _handle_incident_message."""
         settings = _make_settings()
         say = AsyncMock()
         mock_agent = AsyncMock()
         mock_agent.run.return_value = _agent_result("I'll check on that.")
 
-        # Pre-register the incident channel
+        # Pre-register the incident channel with context
         handlers._incident_channels.add("C_INC42")
+        handlers._incident_context["C_INC42"] = {
+            "ticket_id": "INC0010042",
+            "title": "VPN issue",
+            "description": "Can't connect to VPN",
+            "priority": "medium",
+            "summary_ts": None,
+            "original_text": None,
+            "summary_lines": [],
+        }
 
         event = {
             "channel": "C_INC42",
@@ -398,16 +411,121 @@ class TestIncidentChannelRouting:
         }
 
         with patch.object(handlers, "_get_agent", return_value=mock_agent):
-            await handlers._handle_message(event, "any update?", say, settings)
+            await handlers._handle_incident_message(event, "any update?", say, settings)
 
         say.assert_called_once()
-        assert say.call_args[1]["text"] == "I'll check on that."
+        call_kwargs = say.call_args[1]
+        assert call_kwargs["text"] == "I'll check on that."
+        # No thread_ts — replies directly in channel
+        assert "thread_ts" not in call_kwargs
+
+    async def test_incident_channel_seeds_context(self):
+        """First message in incident channel seeds conversation with incident context."""
+        settings = _make_settings()
+        say = AsyncMock()
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = _agent_result("Searching KB for VPN articles...")
+
+        handlers._incident_channels.add("C_INC42")
+        handlers._incident_context["C_INC42"] = {
+            "ticket_id": "INC0010042",
+            "title": "VPN issue",
+            "description": "Can't connect to VPN",
+            "priority": "medium",
+            "summary_ts": None,
+            "original_text": None,
+            "summary_lines": [],
+        }
+
+        event = {
+            "channel": "C_INC42",
+            "channel_type": "group",
+            "user": "U_USER",
+            "text": "find a KB article",
+            "ts": "4000.1",
+        }
+
+        with patch.object(handlers, "_get_agent", return_value=mock_agent):
+            await handlers._handle_incident_message(event, "find a KB article", say, settings)
+
+        # History should have: context seed (2) + user message + assistant response = 4
+        conv_key = ("C_INC42", "incident")
+        history = handlers._conversations[conv_key]
+        assert len(history) == 4
+        # First message should contain incident context
+        assert "INC0010042" in history[0]["content"]
+        assert "VPN issue" in history[0]["content"]
+
+    async def test_incident_channel_single_conversation(self):
+        """All messages in an incident channel share one conversation history."""
+        settings = _make_settings()
+        say = AsyncMock()
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = _agent_result("Got it.")
+
+        handlers._incident_channels.add("C_INC42")
+
+        # Two messages with different ts values
+        for ts in ("4000.1", "4000.2"):
+            event = {
+                "channel": "C_INC42",
+                "channel_type": "group",
+                "user": "U_USER",
+                "text": "update",
+                "ts": ts,
+            }
+            with patch.object(handlers, "_get_agent", return_value=mock_agent):
+                await handlers._handle_incident_message(event, "update", say, settings)
+
+        # Both messages land in the same conversation key
+        conv_key = ("C_INC42", "incident")
+        assert conv_key in handlers._conversations
+        assert len(handlers._conversations[conv_key]) == 4  # 2 user + 2 assistant
+
+    async def test_incident_summary_updated(self):
+        """After agent responds, the initial message is updated with LIVE SUMMARY."""
+        settings = _make_settings()
+        say = AsyncMock()
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = _agent_result("Found 3 KB articles about VPN setup.")
+
+        handlers._incident_channels.add("C_INC42")
+        handlers._incident_context["C_INC42"] = {
+            "ticket_id": "INC0010042",
+            "title": "VPN issue",
+            "description": "Can't connect",
+            "priority": "medium",
+            "summary_ts": "1000.0",
+            "original_text": "*Incident INC0010042*\n*Title:* VPN issue",
+            "summary_lines": [],
+        }
+
+        event = {
+            "channel": "C_INC42",
+            "channel_type": "group",
+            "user": "U_USER",
+            "text": "search KB",
+            "ts": "4000.1",
+        }
+
+        with patch.object(handlers, "_get_agent", return_value=mock_agent):
+            with patch("it_agent.bot.handlers.AsyncWebClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_cls.return_value = mock_client
+                await handlers._handle_incident_message(event, "search KB", say, settings)
+
+        # Verify chat_update was called with the summary
+        mock_client.chat_update.assert_called_once()
+        update_kwargs = mock_client.chat_update.call_args[1]
+        assert update_kwargs["channel"] == "C_INC42"
+        assert update_kwargs["ts"] == "1000.0"
+        assert "LIVE SUMMARY:" in update_kwargs["text"]
+        assert "Found 3 KB articles about VPN setup." in update_kwargs["text"]
 
     async def test_unregistered_channel_ignored(self):
         """Messages in unregistered channels are not processed."""
         event = _other_channel_event()
         settings = _make_settings()
-        # Channel "C_OTHER" is not in _incident_channels and not help_channel_id
         assert event["channel"] not in handlers._incident_channels
         assert event["channel"] != settings.help_channel_id
 
@@ -417,3 +535,30 @@ class TestIncidentChannelRouting:
         event = {"channel": "C_INC42", "text": "<@U_BOT> help", "ts": "5000.1"}
         channel = event.get("channel", "")
         assert channel in handlers._incident_channels
+
+
+class TestParseIncidentMessage:
+    def test_parse_full_message(self):
+        text = (
+            "*Incident INC0129535*\n"
+            "*Title:* Contractor needs VPN access\n"
+            "*Priority:* medium\n"
+            "*Description:* Can't connect to the company VPN\n\n"
+            "<https://test.service-now.com|View in ServiceNow>"
+        )
+        ctx = handlers._parse_incident_message(text)
+        assert ctx["ticket_id"] == "INC0129535"
+        assert ctx["title"] == "Contractor needs VPN access"
+        assert ctx["priority"] == "medium"
+        assert ctx["description"] == "Can't connect to the company VPN"
+
+    def test_parse_partial_message(self):
+        text = "*Incident INC0010001*\n*Title:* Broken laptop"
+        ctx = handlers._parse_incident_message(text)
+        assert ctx["ticket_id"] == "INC0010001"
+        assert ctx["title"] == "Broken laptop"
+        assert "priority" not in ctx
+
+    def test_parse_empty_message(self):
+        ctx = handlers._parse_incident_message("just some random text")
+        assert ctx == {}

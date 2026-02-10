@@ -27,12 +27,88 @@ _ticket_threads: dict[str, tuple[str, str]] = {}
 # Incident channel IDs the bot should actively respond in.
 _incident_channels: set[str] = set()
 
+# Per-incident-channel context: channel_id → {ticket_id, title, description, ...}
+_incident_context: dict[str, dict] = {}
+
 
 def _get_agent(settings: Settings) -> Agent:
     global _agent
     if _agent is None:
         _agent = Agent(settings)
     return _agent
+
+
+def _parse_incident_message(text: str) -> dict:
+    """Extract incident fields from the bot's initial channel message."""
+    ctx: dict[str, str] = {}
+    m = re.search(r"\*Incident (INC\d+)\*", text)
+    if m:
+        ctx["ticket_id"] = m.group(1)
+    m = re.search(r"\*Title:\*\s*(.+)", text)
+    if m:
+        ctx["title"] = m.group(1).strip()
+    m = re.search(r"\*Priority:\*\s*(\w+)", text)
+    if m:
+        ctx["priority"] = m.group(1).strip()
+    m = re.search(r"\*Description:\*\s*(.+?)(?:\n|$)", text)
+    if m:
+        ctx["description"] = m.group(1).strip()
+    return ctx
+
+
+async def discover_incident_channels(settings: Settings) -> None:
+    """Scan private channels the bot belongs to and register incident channels.
+
+    Also fetches the first bot message in each channel to seed incident context.
+    """
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        cursor = None
+        channel_ids: list[str] = []
+        while True:
+            resp = await client.conversations_list(
+                types="private_channel", exclude_archived=True, limit=200, cursor=cursor
+            )
+            for ch in resp.get("channels", []):
+                name = ch.get("name", "")
+                if name.startswith("inc") and ch.get("is_member"):
+                    _incident_channels.add(ch["id"])
+                    channel_ids.append(ch["id"])
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        # Fetch context from the first bot message in each channel
+        for ch_id in channel_ids:
+            try:
+                hist = await client.conversations_history(channel=ch_id, limit=50)
+                # Scan all messages for the incident summary (posted by the bot)
+                for msg in hist.get("messages", []):
+                    if not msg.get("bot_id"):
+                        continue
+                    text = msg.get("text", "")
+                    ctx = _parse_incident_message(text)
+                    if ctx.get("ticket_id"):
+                        # Strip any existing LIVE SUMMARY to get clean original text
+                        original = text.split("\n\n*LIVE SUMMARY:*")[0]
+                        _incident_context[ch_id] = {
+                            **ctx,
+                            "summary_ts": msg["ts"],
+                            "original_text": original,
+                            "summary_lines": [],
+                        }
+                        break
+            except Exception:
+                logger.debug("Could not fetch history for channel %s", ch_id)
+
+        if _incident_channels:
+            logger.info(
+                "Discovered %d incident channel(s) on startup (%d with context)",
+                len(_incident_channels),
+                len(_incident_context),
+            )
+    except Exception:
+        logger.warning("Failed to discover incident channels", exc_info=True)
 
 
 def register_handlers(app: AsyncApp, settings: Settings) -> None:
@@ -84,9 +160,9 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             await _handle_help_channel_message(event, text, say, settings)
             return
 
-        # Incident channels → continue conversation
+        # Incident channels → continue conversation (no threading)
         if channel in _incident_channels:
-            await _handle_message(event, text, say, settings)
+            await _handle_incident_message(event, text, say, settings)
             return
 
         # Other channels → ignore (handled by app_mention only)
@@ -109,6 +185,16 @@ def _register_incident_channels(result: AgentResult) -> None:
         channel_id = r.get("channel_id")
         if channel_id:
             _incident_channels.add(channel_id)
+            ticket = r.get("ticket", {})
+            _incident_context[channel_id] = {
+                "ticket_id": ticket.get("ticket_id", ""),
+                "title": ticket.get("title", ""),
+                "description": ticket.get("description", ""),
+                "priority": ticket.get("priority", ""),
+                "summary_ts": r.get("summary_ts"),
+                "original_text": None,  # will be built on first summary update
+                "summary_lines": [],
+            }
             logger.info("Registered incident channel %s", channel_id)
 
 
@@ -148,6 +234,114 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
             "Something went wrong processing your request. Please try again."
         )
         await say(text="Error processing request", blocks=blocks, thread_ts=thread_ts)
+
+
+async def _handle_incident_message(
+    event: dict, text: str, say, settings: Settings
+) -> None:
+    """Process a message in an incident channel — no threading, single conversation.
+
+    Seeds the conversation with incident context on first interaction and
+    updates the channel's pinned summary message after each agent turn.
+    """
+    channel = event["channel"]
+    user_id = event.get("user", "unknown")
+
+    # Single conversation per incident channel (no per-thread splitting)
+    conv_key = (channel, "incident")
+    history = _conversations.setdefault(conv_key, [])
+
+    # Seed context on first interaction so the agent knows what the channel is about
+    if not history:
+        ctx = _incident_context.get(channel, {})
+        if ctx:
+            context_msg = (
+                f"[Incident context — this channel is dedicated to troubleshooting "
+                f"this specific issue]\n"
+                f"Ticket: {ctx.get('ticket_id', 'unknown')}\n"
+                f"Title: {ctx.get('title', 'N/A')}\n"
+                f"Description: {ctx.get('description', 'N/A')}\n"
+                f"Priority: {ctx.get('priority', 'N/A')}\n"
+                f"Every message in this channel is about this incident. "
+                f"When the user asks you to do something, always assume it relates "
+                f"to this issue — do not ask for clarification about the topic."
+            )
+            history.append({"role": "user", "content": context_msg})
+            history.append({
+                "role": "assistant",
+                "content": (
+                    f"Understood. I'm tracking incident {ctx.get('ticket_id', 'this issue')}: "
+                    f"\"{ctx.get('title', '')}\". "
+                    f"I'll help troubleshoot. What would you like me to do?"
+                ),
+            })
+
+    history.append({"role": "user", "content": text})
+
+    if len(history) > MAX_HISTORY:
+        _conversations[conv_key] = history[-MAX_HISTORY:]
+        history = _conversations[conv_key]
+
+    try:
+        agent = _get_agent(settings)
+        result: AgentResult = await agent.run(history, user_id=user_id)
+
+        history.append({"role": "assistant", "content": result.text})
+
+        _register_incident_channels(result)
+
+        blocks = format_response_blocks(result.text)
+        await say(text=result.text, blocks=blocks)
+
+        # Update the pinned summary message with progress
+        await _update_incident_summary(channel, result.text, settings)
+
+    except Exception:
+        logger.exception("Error processing incident channel message")
+        blocks = format_error_blocks(
+            "Something went wrong processing your request. Please try again."
+        )
+        await say(text="Error processing request", blocks=blocks)
+
+
+async def _update_incident_summary(
+    channel: str, agent_response: str, settings: Settings
+) -> None:
+    """Append a summary line to the incident channel's initial message."""
+    ctx = _incident_context.get(channel)
+    if not ctx or not ctx.get("summary_ts"):
+        return
+
+    # Build summary line: first sentence, max 150 chars
+    first_sentence = agent_response.split("\n")[0].strip()
+    if len(first_sentence) > 150:
+        first_sentence = first_sentence[:147] + "..."
+    ctx.setdefault("summary_lines", []).append(first_sentence)
+
+    # Rebuild the message: original text + live summary
+    original = ctx.get("original_text") or ""
+    if not original:
+        # Fallback: build from context fields
+        original = (
+            f"*Incident {ctx.get('ticket_id', '')}*\n"
+            f"*Title:* {ctx.get('title', '')}\n"
+            f"*Priority:* {ctx.get('priority', '')}\n"
+            f"*Description:* {ctx.get('description', '')}"
+        )
+        ctx["original_text"] = original
+
+    summary_bullets = "\n".join(f"• {line}" for line in ctx["summary_lines"])
+    updated_text = f"{original}\n\n*LIVE SUMMARY:*\n{summary_bullets}"
+
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        await client.chat_update(
+            channel=channel,
+            ts=ctx["summary_ts"],
+            text=updated_text,
+        )
+    except Exception:
+        logger.warning("Failed to update incident summary in %s", channel, exc_info=True)
 
 
 async def _handle_help_channel_message(
