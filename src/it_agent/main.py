@@ -5,6 +5,7 @@ from google import genai
 from qdrant_client import QdrantClient
 
 from it_agent.bot.app import create_app, start_app
+from it_agent.bot import events
 from it_agent.bot.handlers import discover_incident_channels, start_auto_close_loop
 from it_agent.config import get_settings
 from it_agent.kb.indexer import index_knowledge_base
@@ -22,8 +23,17 @@ def main() -> None:
 
 
 async def _start(settings) -> None:
+    events.configure(settings.dashboard_url)
+
     await _ensure_kb_indexed(settings)
     await discover_incident_channels(settings)
+
+    from it_agent.bot.handlers import _incident_channels, _resolved_pending_close
+    await events.emit("bot_startup", {
+        "channels_discovered": len(_incident_channels),
+        "pending_auto_close": len(_resolved_pending_close),
+    })
+
     app = create_app(settings)
 
     # Start the auto-close background loop (closes resolved tickets after 48h)

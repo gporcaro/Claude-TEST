@@ -11,6 +11,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from it_agent.agent import executor
 from it_agent.agent.core import Agent, AgentResult
+from it_agent.bot.events import emit
 from it_agent.bot.formatters import (
     format_error_blocks,
     format_response_blocks,
@@ -343,7 +344,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
     executor._on_ticket_assigned = _assignment_callback
 
 
-def _register_incident_channels(result: AgentResult) -> None:
+async def _register_incident_channels(result: AgentResult) -> None:
     """Track any incident channels created during this agent run."""
     for tc in result.tool_calls:
         if tc["name"] != "create_ticket":
@@ -353,16 +354,30 @@ def _register_incident_channels(result: AgentResult) -> None:
         if channel_id:
             _incident_channels.add(channel_id)
             ticket = r.get("ticket", {})
+            ticket_id = ticket.get("ticket_id", "")
+            title = ticket.get("title", "")
+            priority = ticket.get("priority", "")
             _incident_context[channel_id] = {
-                "ticket_id": ticket.get("ticket_id", ""),
-                "title": ticket.get("title", ""),
+                "ticket_id": ticket_id,
+                "title": title,
                 "description": ticket.get("description", ""),
-                "priority": ticket.get("priority", ""),
+                "priority": priority,
                 "summary_ts": r.get("summary_ts"),
                 "original_text": None,  # will be built on first summary update
                 "summary_lines": [],
             }
             logger.info("Registered incident channel %s", channel_id)
+            await emit("ticket_created", {
+                "ticket_id": ticket_id,
+                "title": title,
+                "priority": priority,
+                "channel_id": channel_id,
+            })
+            await emit("channel_created", {
+                "channel_id": channel_id,
+                "channel_name": r.get("channel_name", ""),
+                "ticket_id": ticket_id,
+            })
 
 
 async def _handle_message(event: dict, text: str, say, settings: Settings) -> None:
@@ -370,6 +385,11 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
+
+    await emit("message_received", {
+        "source": "dm", "channel": channel, "user_id": user_id,
+        "text": text[:200], "thread_ts": thread_ts,
+    })
 
     # Build conversation key
     conv_key = (channel, thread_ts)
@@ -401,15 +421,16 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         # Append assistant response to history
         history.append({"role": "assistant", "content": result.text})
 
-        _register_incident_channels(result)
+        await _register_incident_channels(result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
         blocks = format_response_blocks(result.text, sn_url)
         await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Error processing message")
+        await emit("error", {"source": "dm", "message": str(exc)[:300]})
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
@@ -426,6 +447,11 @@ async def _handle_incident_message(
     """
     channel = event["channel"]
     user_id = event.get("user", "unknown")
+
+    await emit("message_received", {
+        "source": "incident", "channel": channel, "user_id": user_id,
+        "text": text[:200], "thread_ts": "",
+    })
 
     # Single conversation per incident channel (no per-thread splitting)
     conv_key = (channel, "incident")
@@ -515,7 +541,7 @@ async def _handle_incident_message(
 
         history.append({"role": "assistant", "content": result.text})
 
-        _register_incident_channels(result)
+        await _register_incident_channels(result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
@@ -525,8 +551,9 @@ async def _handle_incident_message(
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Error processing incident channel message")
+        await emit("error", {"source": "incident", "message": str(exc)[:300]})
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
@@ -546,6 +573,12 @@ async def _update_incident_summary(
     if len(first_sentence) > 150:
         first_sentence = first_sentence[:147] + "..."
     ctx.setdefault("summary_lines", []).append(first_sentence)
+
+    await emit("summary_updated", {
+        "channel_id": channel,
+        "ticket_id": ctx.get("ticket_id", ""),
+        "line": first_sentence,
+    })
 
     # Rebuild the message: original text + live summary
     original = ctx.get("original_text") or ""
@@ -582,6 +615,11 @@ async def _handle_help_channel_message(
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
 
+    await emit("message_received", {
+        "source": "help-it", "channel": channel, "user_id": user_id,
+        "text": text[:200], "thread_ts": thread_ts,
+    })
+
     conv_key = (channel, thread_ts)
 
     # Recover history from Slack if we have none (e.g. after bot restart)
@@ -607,7 +645,7 @@ async def _handle_help_channel_message(
 
         history.append({"role": "assistant", "content": result.text})
 
-        _register_incident_channels(result)
+        await _register_incident_channels(result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
@@ -632,6 +670,10 @@ async def _handle_help_channel_message(
                         display_name = user_id
                     fwd_text = f"*{display_name}* in #help-it thread:\n>{text}"
                     await slack.chat_postMessage(channel=inc_channel, text=fwd_text)
+                    await emit("thread_forwarded", {
+                        "from_channel": channel, "to_channel": inc_channel,
+                        "user": display_name,
+                    })
             except Exception:
                 logger.debug("Failed to forward thread reply to incident channel", exc_info=True)
 
@@ -640,6 +682,12 @@ async def _handle_help_channel_message(
         for tc in result.tool_calls:
             if tc["name"] == "search_knowledge_base":
                 kb_results.extend(tc.get("result", {}).get("results", []))
+
+        if kb_results:
+            await emit("kb_search", {
+                "result_count": len(kb_results),
+                "article_ids": [a.get("id", "") for a in kb_results],
+            })
 
         # Post threaded follow-ups for any tickets created during this run
         for tc in result.tool_calls:
@@ -697,8 +745,9 @@ async def _handle_help_channel_message(
                     channel_id, kb_results, settings,
                 )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Error processing #help-it message")
+        await emit("error", {"source": "help-it", "message": str(exc)[:300]})
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
@@ -764,6 +813,11 @@ async def post_resolution_update(
 
         await client.chat_postMessage(channel=channel, text=message, thread_ts=thread_ts)
 
+    await emit("ticket_resolved", {
+        "ticket_id": ticket_id,
+        "close_notes": ticket_data.get("close_notes", "")[:200],
+    })
+
     # Rename the incident channel to append "-resolved"
     await _rename_incident_channel_resolved(ticket_id, client)
 
@@ -799,6 +853,10 @@ async def _handle_ticket_assigned(
     slack_id = slack_user["slack_id"]
     real_name = slack_user["real_name"]
     client = AsyncWebClient(token=settings.slack_bot_token)
+
+    await emit("ticket_assigned", {
+        "ticket_id": ticket_id, "assignee_name": real_name, "channel_id": channel_id,
+    })
 
     # Invite the assignee to the channel
     try:
@@ -943,6 +1001,9 @@ async def _auto_close_ticket(
         logger.info("Archived incident channel %s for ticket %s", channel_id, ticket_id)
     except Exception:
         logger.warning("Auto-close: failed to archive channel %s", channel_id, exc_info=True)
+
+    await emit("ticket_auto_closed", {"ticket_id": ticket_id, "channel_id": channel_id})
+    await emit("channel_archived", {"ticket_id": ticket_id, "channel_id": channel_id})
 
     # Clean up tracking
     _incident_channels.discard(channel_id)

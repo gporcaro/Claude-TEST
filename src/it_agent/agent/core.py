@@ -11,6 +11,7 @@ from google.genai import types
 
 from it_agent.agent.executor import execute_tool
 from it_agent.agent.tools import TOOLS
+from it_agent.bot.events import emit
 from it_agent.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,8 @@ class Agent:
 
     async def run(self, messages: list[dict], user_id: str = "unknown") -> AgentResult:
         """Run the agent tool loop and return a structured AgentResult."""
+        await emit("agent_start", {"user_id": user_id, "message_count": len(messages)})
+
         # Convert incoming messages to Gemini Content objects.
         gemini_contents: list[types.Content] = []
         for m in messages:
@@ -112,7 +115,12 @@ class Agent:
 
             # If no function calls, the model is done — return the text.
             if not response.function_calls:
-                return AgentResult(text=_extract_text(response), tool_calls=all_tool_calls)
+                text = _extract_text(response)
+                await emit("agent_response", {
+                    "text_preview": text[:200],
+                    "tool_call_count": len(all_tool_calls),
+                })
+                return AgentResult(text=text, tool_calls=all_tool_calls)
 
             # The model wants to call tools — add its response as a model turn.
             gemini_contents.append(response.candidates[0].content)
@@ -121,6 +129,7 @@ class Agent:
             function_responses: list[types.Part] = []
             for fc in response.function_calls:
                 logger.info("Executing tool: %s(%s)", fc.name, json.dumps(fc.args))
+                await emit("tool_call", {"tool_name": fc.name, "args": dict(fc.args) if fc.args else {}})
                 result = await execute_tool(fc.name, fc.args, self.settings, user_id)
 
                 result_parsed = json.loads(result)
@@ -129,6 +138,8 @@ class Agent:
                     "args": dict(fc.args) if fc.args else {},
                     "result": result_parsed,
                 })
+                result_summary = str(result_parsed)[:200]
+                await emit("tool_result", {"tool_name": fc.name, "result_summary": result_summary})
 
                 function_responses.append(
                     types.Part.from_function_response(
@@ -141,13 +152,15 @@ class Agent:
             gemini_contents.append(types.Content(role="user", parts=function_responses))
 
         # Safety: max loops reached
-        return AgentResult(
-            text=(
-                "I've reached my processing limit for this request. "
-                "Please try breaking your question into smaller parts."
-            ),
-            tool_calls=all_tool_calls,
+        text = (
+            "I've reached my processing limit for this request. "
+            "Please try breaking your question into smaller parts."
         )
+        await emit("agent_response", {
+            "text_preview": text[:200],
+            "tool_call_count": len(all_tool_calls),
+        })
+        return AgentResult(text=text, tool_calls=all_tool_calls)
 
 
 def _extract_text(response) -> str:

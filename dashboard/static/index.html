@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IT Bot Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+    .event-feed { max-height: calc(100vh - 220px); overflow-y: auto; }
+    .event-feed::-webkit-scrollbar { width: 6px; }
+    .event-feed::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .fade-in { animation: fadeIn 0.3s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    .badge { cursor: pointer; transition: opacity 0.2s; }
+    .badge.dimmed { opacity: 0.3; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  </style>
+</head>
+<body class="min-h-screen">
+  <!-- Header -->
+  <header class="bg-slate-800 border-b border-slate-700 px-6 py-3 flex items-center justify-between">
+    <h1 class="text-xl font-bold text-white">IT Bot Dashboard</h1>
+    <div id="conn-status" class="flex items-center gap-2 text-sm">
+      <span id="conn-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+      <span id="conn-text" class="text-slate-400">Disconnected</span>
+    </div>
+  </header>
+
+  <!-- Main layout -->
+  <div class="flex flex-1 h-[calc(100vh-108px)]">
+    <!-- Left sidebar: Active Tickets -->
+    <aside class="w-72 border-r border-slate-700 p-4 overflow-y-auto bg-slate-800/50">
+      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">Active Tickets</h2>
+      <div id="tickets-panel" class="space-y-2">
+        <p class="text-slate-500 text-sm italic">No active tickets</p>
+      </div>
+    </aside>
+
+    <!-- Center: Event Feed -->
+    <main class="flex-1 flex flex-col p-4">
+      <!-- Filter bar -->
+      <div id="filter-bar" class="flex flex-wrap gap-1.5 mb-3"></div>
+      <!-- Event feed -->
+      <div id="event-feed" class="event-feed flex-1 space-y-1"></div>
+    </main>
+
+    <!-- Right sidebar: Recent Tool Calls -->
+    <aside class="w-80 border-l border-slate-700 p-4 overflow-y-auto bg-slate-800/50">
+      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">Recent Tool Calls</h2>
+      <div id="tools-panel" class="space-y-2">
+        <p class="text-slate-500 text-sm italic">No tool calls yet</p>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Stats bar -->
+  <footer class="bg-slate-800 border-t border-slate-700 px-6 py-2 flex items-center gap-8 text-sm text-slate-400">
+    <span>Messages/hr: <strong id="stat-msg-hr" class="text-white">0</strong></span>
+    <span>Open tickets: <strong id="stat-open" class="text-white">0</strong></span>
+    <span>Resolved today: <strong id="stat-resolved" class="text-white">0</strong></span>
+    <span>Total events: <strong id="stat-total" class="text-white">0</strong></span>
+  </footer>
+
+<script>
+(function() {
+  // --- State ---
+  const state = {
+    events: [],
+    tickets: {},          // ticket_id -> {title, priority, status, channel_id}
+    toolCalls: [],        // last 10
+    messageTimestamps: [], // for msgs/hr calc
+    resolvedToday: 0,
+    totalEvents: 0,
+    activeFilters: new Set(), // event types to HIDE
+  };
+
+  // --- Event type config ---
+  const EVENT_COLORS = {
+    bot_startup:      { bg: 'bg-purple-900/50', border: 'border-purple-500', text: 'text-purple-300', badge: 'bg-purple-600' },
+    message_received: { bg: 'bg-blue-900/50',   border: 'border-blue-500',   text: 'text-blue-300',   badge: 'bg-blue-600' },
+    agent_start:      { bg: 'bg-cyan-900/50',   border: 'border-cyan-500',   text: 'text-cyan-300',   badge: 'bg-cyan-600' },
+    tool_call:        { bg: 'bg-indigo-900/50', border: 'border-indigo-500', text: 'text-indigo-300', badge: 'bg-indigo-600' },
+    tool_result:      { bg: 'bg-indigo-900/50', border: 'border-indigo-500', text: 'text-indigo-300', badge: 'bg-indigo-600' },
+    agent_response:   { bg: 'bg-teal-900/50',   border: 'border-teal-500',   text: 'text-teal-300',   badge: 'bg-teal-600' },
+    ticket_created:   { bg: 'bg-green-900/50',  border: 'border-green-500',  text: 'text-green-300',  badge: 'bg-green-600' },
+    ticket_resolved:  { bg: 'bg-green-900/50',  border: 'border-green-500',  text: 'text-green-300',  badge: 'bg-green-600' },
+    ticket_assigned:  { bg: 'bg-yellow-900/50', border: 'border-yellow-500', text: 'text-yellow-300', badge: 'bg-yellow-600' },
+    ticket_auto_closed:{ bg: 'bg-orange-900/50',border: 'border-orange-500', text: 'text-orange-300', badge: 'bg-orange-600' },
+    channel_created:  { bg: 'bg-green-900/50',  border: 'border-green-500',  text: 'text-green-300',  badge: 'bg-green-600' },
+    channel_archived: { bg: 'bg-orange-900/50', border: 'border-orange-500', text: 'text-orange-300', badge: 'bg-orange-600' },
+    kb_search:        { bg: 'bg-sky-900/50',    border: 'border-sky-500',    text: 'text-sky-300',    badge: 'bg-sky-600' },
+    thread_forwarded: { bg: 'bg-slate-700/50',  border: 'border-slate-500',  text: 'text-slate-300',  badge: 'bg-slate-600' },
+    summary_updated:  { bg: 'bg-slate-700/50',  border: 'border-slate-500',  text: 'text-slate-300',  badge: 'bg-slate-600' },
+    error:            { bg: 'bg-red-900/50',    border: 'border-red-500',    text: 'text-red-300',    badge: 'bg-red-600' },
+  };
+  const DEFAULT_COLOR = { bg: 'bg-slate-800/50', border: 'border-slate-600', text: 'text-slate-300', badge: 'bg-slate-600' };
+
+  function getColor(type) { return EVENT_COLORS[type] || DEFAULT_COLOR; }
+
+  // --- DOM refs ---
+  const feedEl = document.getElementById('event-feed');
+  const ticketsEl = document.getElementById('tickets-panel');
+  const toolsEl = document.getElementById('tools-panel');
+  const filterBar = document.getElementById('filter-bar');
+  const connDot = document.getElementById('conn-dot');
+  const connText = document.getElementById('conn-text');
+
+  // --- Filter bar ---
+  const allTypes = Object.keys(EVENT_COLORS);
+  allTypes.forEach(type => {
+    const c = getColor(type);
+    const btn = document.createElement('button');
+    btn.className = `badge text-xs px-2 py-0.5 rounded-full text-white ${c.badge}`;
+    btn.textContent = type;
+    btn.dataset.type = type;
+    btn.addEventListener('click', () => {
+      if (state.activeFilters.has(type)) {
+        state.activeFilters.delete(type);
+        btn.classList.remove('dimmed');
+      } else {
+        state.activeFilters.add(type);
+        btn.classList.add('dimmed');
+      }
+      rerenderFeed();
+    });
+    filterBar.appendChild(btn);
+  });
+
+  // --- Format helpers ---
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  function truncate(s, n) {
+    if (!s) return '';
+    return s.length > n ? s.substring(0, n) + '...' : s;
+  }
+
+  function summarizeData(data) {
+    if (!data || Object.keys(data).length === 0) return '';
+    const parts = [];
+    for (const [k, v] of Object.entries(data)) {
+      const val = typeof v === 'string' ? truncate(v, 60) : JSON.stringify(v);
+      parts.push(`${k}=${val}`);
+    }
+    return parts.join(' | ');
+  }
+
+  // --- Render event row ---
+  function renderEvent(evt) {
+    const c = getColor(evt.type);
+    const div = document.createElement('div');
+    div.className = `fade-in flex items-start gap-3 px-3 py-2 rounded border-l-2 ${c.bg} ${c.border}`;
+    if (state.activeFilters.has(evt.type)) div.style.display = 'none';
+
+    const time = document.createElement('span');
+    time.className = 'text-xs text-slate-500 font-mono whitespace-nowrap pt-0.5';
+    time.textContent = fmtTime(evt.timestamp);
+
+    const badge = document.createElement('span');
+    badge.className = `text-xs px-2 py-0.5 rounded-full text-white whitespace-nowrap ${c.badge}`;
+    badge.textContent = evt.type;
+
+    const detail = document.createElement('span');
+    detail.className = `text-sm ${c.text} break-all`;
+    detail.textContent = summarizeData(evt.data);
+
+    div.appendChild(time);
+    div.appendChild(badge);
+    div.appendChild(detail);
+    return div;
+  }
+
+  function rerenderFeed() {
+    feedEl.innerHTML = '';
+    state.events.forEach(evt => feedEl.appendChild(renderEvent(evt)));
+    feedEl.scrollTop = feedEl.scrollHeight;
+  }
+
+  // --- Render ticket card ---
+  function renderTickets() {
+    const entries = Object.entries(state.tickets);
+    if (entries.length === 0) {
+      ticketsEl.innerHTML = '<p class="text-slate-500 text-sm italic">No active tickets</p>';
+      return;
+    }
+    ticketsEl.innerHTML = '';
+    entries.forEach(([tid, t]) => {
+      const card = document.createElement('div');
+      const statusColor = t.status === 'resolved' ? 'bg-green-600' : t.status === 'closed' ? 'bg-slate-600' : 'bg-yellow-600';
+      card.className = 'bg-slate-700/60 rounded-lg p-3 border border-slate-600';
+      card.innerHTML = `
+        <div class="flex items-center justify-between mb-1">
+          <span class="text-xs font-mono text-blue-400">${tid}</span>
+          <span class="text-xs px-1.5 py-0.5 rounded ${statusColor} text-white">${t.status || 'open'}</span>
+        </div>
+        <p class="text-sm text-slate-200 leading-snug">${truncate(t.title, 80) || 'Untitled'}</p>
+        ${t.priority ? `<span class="text-xs text-slate-400">Priority: ${t.priority}</span>` : ''}
+      `;
+      ticketsEl.appendChild(card);
+    });
+  }
+
+  // --- Render tool calls ---
+  function renderTools() {
+    if (state.toolCalls.length === 0) {
+      toolsEl.innerHTML = '<p class="text-slate-500 text-sm italic">No tool calls yet</p>';
+      return;
+    }
+    toolsEl.innerHTML = '';
+    // Show newest first
+    [...state.toolCalls].reverse().forEach(tc => {
+      const item = document.createElement('div');
+      const isResult = tc._isResult;
+      const statusDot = isResult
+        ? (tc.success ? 'bg-green-400' : 'bg-red-400')
+        : 'bg-yellow-400 pulse';
+      item.className = 'bg-slate-700/60 rounded-lg p-3 border border-slate-600';
+      item.innerHTML = `
+        <div class="flex items-center gap-2 mb-1">
+          <span class="w-2 h-2 rounded-full ${statusDot}"></span>
+          <span class="text-sm font-semibold text-indigo-300">${tc.tool_name}</span>
+          <span class="text-xs text-slate-500 ml-auto">${fmtTime(tc.timestamp)}</span>
+        </div>
+        <p class="text-xs text-slate-400 font-mono break-all">${truncate(tc.detail, 120)}</p>
+      `;
+      toolsEl.appendChild(item);
+    });
+  }
+
+  // --- Stats ---
+  function updateStats() {
+    const now = Date.now() / 1000;
+    const oneHourAgo = now - 3600;
+    const msgsInHour = state.messageTimestamps.filter(t => t > oneHourAgo).length;
+    document.getElementById('stat-msg-hr').textContent = msgsInHour;
+    document.getElementById('stat-open').textContent = Object.values(state.tickets).filter(t => t.status !== 'resolved' && t.status !== 'closed').length;
+    document.getElementById('stat-resolved').textContent = state.resolvedToday;
+    document.getElementById('stat-total').textContent = state.totalEvents;
+  }
+
+  // --- Process incoming event ---
+  function processEvent(evt) {
+    state.events.push(evt);
+    state.totalEvents++;
+    // Keep last 500 in UI
+    if (state.events.length > 500) state.events.shift();
+
+    // Track state by event type
+    switch (evt.type) {
+      case 'message_received':
+        state.messageTimestamps.push(evt.timestamp);
+        break;
+      case 'ticket_created':
+        if (evt.data.ticket_id) {
+          state.tickets[evt.data.ticket_id] = {
+            title: evt.data.title || '',
+            priority: evt.data.priority || '',
+            status: 'open',
+            channel_id: evt.data.channel_id || '',
+          };
+        }
+        break;
+      case 'ticket_resolved':
+        if (evt.data.ticket_id && state.tickets[evt.data.ticket_id]) {
+          state.tickets[evt.data.ticket_id].status = 'resolved';
+        }
+        state.resolvedToday++;
+        break;
+      case 'ticket_assigned':
+        if (evt.data.ticket_id && state.tickets[evt.data.ticket_id]) {
+          state.tickets[evt.data.ticket_id].assignee = evt.data.assignee_name || '';
+        }
+        break;
+      case 'ticket_auto_closed':
+        if (evt.data.ticket_id) {
+          if (state.tickets[evt.data.ticket_id]) {
+            state.tickets[evt.data.ticket_id].status = 'closed';
+          }
+        }
+        break;
+      case 'tool_call':
+        state.toolCalls.push({
+          tool_name: evt.data.tool_name || 'unknown',
+          detail: JSON.stringify(evt.data.args || {}),
+          timestamp: evt.timestamp,
+          _isResult: false,
+          success: null,
+        });
+        if (state.toolCalls.length > 10) state.toolCalls.shift();
+        break;
+      case 'tool_result':
+        state.toolCalls.push({
+          tool_name: evt.data.tool_name || 'unknown',
+          detail: evt.data.result_summary || '',
+          timestamp: evt.timestamp,
+          _isResult: true,
+          success: true,
+        });
+        if (state.toolCalls.length > 10) state.toolCalls.shift();
+        break;
+      case 'error':
+        // Mark latest matching tool call as failed if relevant
+        break;
+    }
+
+    // Append to feed (avoid full re-render)
+    const row = renderEvent(evt);
+    feedEl.appendChild(row);
+    feedEl.scrollTop = feedEl.scrollHeight;
+
+    renderTickets();
+    renderTools();
+    updateStats();
+  }
+
+  // --- WebSocket connection ---
+  let ws = null;
+  let reconnectTimer = null;
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      connDot.className = 'w-2.5 h-2.5 rounded-full bg-green-500';
+      connText.textContent = 'Connected';
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+
+    ws.onmessage = (msg) => {
+      try {
+        const evt = JSON.parse(msg.data);
+        processEvent(evt);
+      } catch (e) {
+        console.error('Failed to parse event:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      connDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
+      connText.textContent = 'Disconnected';
+      reconnectTimer = setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+  }
+
+  connect();
+  // Refresh stats every 30s
+  setInterval(updateStats, 30000);
+})();
+</script>
+</body>
+</html>
