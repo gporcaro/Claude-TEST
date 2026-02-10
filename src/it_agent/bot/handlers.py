@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
@@ -14,6 +16,7 @@ from it_agent.bot.formatters import (
     linkify_servicenow_refs,
 )
 from it_agent.config import Settings
+from it_agent.servicenow.client import ServiceNowClient
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,15 @@ _incident_channels: set[str] = set()
 
 # Per-incident-channel context: channel_id → {ticket_id, title, description, ...}
 _incident_context: dict[str, dict] = {}
+
+# Resolved tickets pending auto-close: ticket_id → resolved_epoch
+_resolved_pending_close: dict[str, float] = {}
+
+# 48 hours in seconds
+_AUTO_CLOSE_DELAY = 48 * 60 * 60
+
+# How often to check (1 hour)
+_AUTO_CLOSE_CHECK_INTERVAL = 60 * 60
 
 
 def _get_agent(settings: Settings) -> Agent:
@@ -444,6 +456,10 @@ async def post_resolution_update(
     # Rename the incident channel to append "-resolved"
     await _rename_incident_channel_resolved(ticket_id, client)
 
+    # Schedule auto-close after 48 hours
+    _resolved_pending_close[ticket_id] = time.time()
+    logger.info("Ticket %s queued for auto-close in 48h", ticket_id)
+
 
 async def _rename_incident_channel_resolved(
     ticket_id: str, client: AsyncWebClient
@@ -469,3 +485,101 @@ async def _rename_incident_channel_resolved(
         logger.info("Renamed incident channel %s → %s", current_name, new_name)
     except Exception:
         logger.warning("Failed to rename incident channel %s", channel_id, exc_info=True)
+
+
+async def start_auto_close_loop(settings: Settings) -> None:
+    """Background loop that closes resolved tickets after 48 hours and archives their channels."""
+    while True:
+        await asyncio.sleep(_AUTO_CLOSE_CHECK_INTERVAL)
+        try:
+            await _process_pending_auto_closes(settings)
+        except Exception:
+            logger.warning("Auto-close loop iteration failed", exc_info=True)
+
+
+async def _process_pending_auto_closes(settings: Settings) -> None:
+    """Check for tickets resolved > 48h ago and close them."""
+    now = time.time()
+    ready = [
+        tid for tid, resolved_at in _resolved_pending_close.items()
+        if now - resolved_at >= _AUTO_CLOSE_DELAY
+    ]
+    if not ready:
+        return
+
+    logger.info("Auto-closing %d ticket(s) after 48h: %s", len(ready), ", ".join(ready))
+
+    client = AsyncWebClient(token=settings.slack_bot_token)
+    sn_client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password
+    )
+
+    try:
+        for ticket_id in ready:
+            await _auto_close_ticket(ticket_id, settings, client, sn_client)
+            _resolved_pending_close.pop(ticket_id, None)
+    finally:
+        await sn_client.close()
+
+
+async def _auto_close_ticket(
+    ticket_id: str,
+    settings: Settings,
+    slack_client: AsyncWebClient,
+    sn_client: ServiceNowClient,
+) -> None:
+    """Close a single ticket in ServiceNow, post a note, and archive the channel."""
+    # 1. Close ticket in ServiceNow
+    try:
+        incident = await sn_client.get_incident(ticket_id)
+        if incident is None:
+            logger.warning("Auto-close: ticket %s not found in ServiceNow", ticket_id)
+            return
+        # Only close if still in resolved state
+        if incident.get("status") not in ("resolved",):
+            logger.info("Auto-close: ticket %s is %s, skipping", ticket_id, incident.get("status"))
+            return
+        await sn_client.update_incident(
+            incident["sys_id"],
+            {"status": "closed", "close_notes": "Auto-closed after 48 hours in resolved state."},
+            current_state=incident.get("_raw_state", "6"),
+        )
+        logger.info("Auto-closed ticket %s in ServiceNow", ticket_id)
+    except Exception:
+        logger.warning("Auto-close: failed to close %s in ServiceNow", ticket_id, exc_info=True)
+        return  # don't archive if close failed
+
+    # 2. Find the incident channel
+    channel_id: str | None = None
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            channel_id = ch_id
+            break
+
+    if channel_id is None:
+        return
+
+    # 3. Post farewell note
+    sn_url = settings.sn_instance_url
+    note = (
+        f":lock: *This channel is now being archived.*\n\n"
+        f"Ticket {ticket_id} was automatically closed after 48 hours in "
+        f"resolved state. If you need further assistance on this issue, "
+        f"please open a new request in #help-it."
+    )
+    note = linkify_servicenow_refs(note, sn_url)
+    try:
+        await slack_client.chat_postMessage(channel=channel_id, text=note)
+    except Exception:
+        logger.warning("Auto-close: failed to post farewell note in %s", channel_id, exc_info=True)
+
+    # 4. Archive the channel
+    try:
+        await slack_client.conversations_archive(channel=channel_id)
+        logger.info("Archived incident channel %s for ticket %s", channel_id, ticket_id)
+    except Exception:
+        logger.warning("Auto-close: failed to archive channel %s", channel_id, exc_info=True)
+
+    # Clean up tracking
+    _incident_channels.discard(channel_id)
+    _incident_context.pop(channel_id, None)
