@@ -195,10 +195,20 @@ async def test_create_ticket_creates_slack_channel():
     incident = _normalized_incident()
 
     mock_slack = AsyncMock()
-    mock_slack.users_info.return_value = {"user": {"name": "gporcaro"}}
+    mock_slack.users_info.return_value = {
+        "user": {
+            "name": "gporcaro",
+            "profile": {"email": "gporcaro@test.com", "real_name": "G Porcaro"},
+        }
+    }
     mock_slack.conversations_create.return_value = {"channel": {"id": "C999"}}
     mock_slack.conversations_invite.return_value = {"ok": True}
-    mock_slack.chat_postMessage.return_value = {"ok": True}
+    mock_slack.chat_postMessage.return_value = {"ok": True, "ts": "1234567890.123456"}
+
+    # Mock SN user lookup response
+    mock_sn_user_resp = MagicMock()
+    mock_sn_user_resp.json.return_value = {"result": [{"sys_id": "sn_user_123"}]}
+    mock_sn_user_resp.raise_for_status.return_value = None
 
     with (
         patch("it_agent.tools.tickets.ServiceNowClient") as mock_sn_cls,
@@ -206,6 +216,7 @@ async def test_create_ticket_creates_slack_channel():
     ):
         mock_sn = AsyncMock()
         mock_sn.create_incident.return_value = incident
+        mock_sn._client.get.return_value = mock_sn_user_resp
         mock_sn_cls.return_value = mock_sn
 
         result = await create_ticket(
@@ -220,8 +231,13 @@ async def test_create_ticket_creates_slack_channel():
     assert result["channel_name"] == "inc0010001-gporcaro"
     assert result["channel_id"] == "C999"
 
-    # Verify Slack calls
-    mock_slack.users_info.assert_called_once_with(user="U123")
+    # Verify caller resolution looked up the user
+    mock_slack.users_info.assert_any_call(user="U123")
+
+    # Verify incident was created with resolved SN sys_id
+    create_call_args = mock_sn.create_incident.call_args[0][0]
+    assert create_call_args["caller_id"] == "sn_user_123"
+
     mock_slack.conversations_create.assert_called_once_with(
         name="inc0010001-gporcaro", is_private=True
     )

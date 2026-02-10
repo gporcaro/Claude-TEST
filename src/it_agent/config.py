@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "it_kb"
 
+    # SMTP (used by dashboard for MFA)
+    smtp_email: str = ""
+    smtp_app_password: str = ""
+
     # Dashboard
     dashboard_url: str = "http://localhost:8050"
 

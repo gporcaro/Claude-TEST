@@ -17,6 +17,7 @@ def test_all_tools_present():
         "update_ticket",
         "list_tickets",
         "search_knowledge_base",
+        "lookup_user",
     }
     assert names == expected
 

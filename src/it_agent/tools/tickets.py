@@ -26,18 +26,21 @@ async def create_ticket(
         return {"error": "Settings not configured"}
 
     # Resolve Slack user ID → ServiceNow sys_id for the caller field.
-    # Fall back to the raw Slack ID if resolution fails.
-    caller_id = _user_id
+    caller_id = ""
     if _user_id and _user_id != "unknown":
         try:
             slack = AsyncWebClient(token=_settings.slack_bot_token)
             user_info = await slack.users_info(user=_user_id)
-            email = user_info.get("user", {}).get("profile", {}).get("email", "")
-            if email:
-                sn_client = ServiceNowClient(
-                    _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
-                )
-                try:
+            profile = user_info.get("user", {}).get("profile", {})
+            email = profile.get("email", "")
+            real_name = profile.get("real_name", "")
+
+            sn_client = ServiceNowClient(
+                _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
+            )
+            try:
+                # 1) Try email lookup first
+                if email:
                     resp = await sn_client._client.get(
                         f"{sn_client.base_url}/table/sys_user",
                         params={
@@ -50,9 +53,31 @@ async def create_ticket(
                     results = resp.json().get("result", [])
                     if results:
                         caller_id = results[0]["sys_id"]
-                        logger.info("Resolved caller %s → SN sys_id %s", _user_id, caller_id)
-                finally:
-                    await sn_client.close()
+                        logger.info("Resolved caller %s via email (%s) → SN sys_id %s", _user_id, email, caller_id)
+
+                # 2) Fall back to name lookup if email didn't match
+                if not caller_id and real_name:
+                    resp = await sn_client._client.get(
+                        f"{sn_client.base_url}/table/sys_user",
+                        params={
+                            "sysparm_query": f"name={real_name}",
+                            "sysparm_limit": "1",
+                            "sysparm_fields": "sys_id",
+                        },
+                    )
+                    resp.raise_for_status()
+                    results = resp.json().get("result", [])
+                    if results:
+                        caller_id = results[0]["sys_id"]
+                        logger.info("Resolved caller %s via name (%s) → SN sys_id %s", _user_id, real_name, caller_id)
+
+                if not caller_id:
+                    logger.warning(
+                        "Could not find SN user for Slack user %s (email=%s, name=%s)",
+                        _user_id, email, real_name,
+                    )
+            finally:
+                await sn_client.close()
         except Exception:
             logger.warning("Could not resolve Slack user %s to SN sys_id", _user_id, exc_info=True)
 

@@ -63,7 +63,9 @@ async def test_search_kb_returns_results():
         _make_hit("KB002", "Password Reset", 0.80),
     ]
     mock_qclient = MagicMock()
-    mock_qclient.search.return_value = hits
+    mock_response = MagicMock()
+    mock_response.points = hits
+    mock_qclient.query_points.return_value = mock_response
 
     with patch("it_agent.kb.search.QdrantClient", return_value=mock_qclient):
         result = await search_kb("how to connect VPN", settings, genai, limit=5)
@@ -86,7 +88,9 @@ async def test_search_kb_deduplicates_chunks():
         _make_hit("KB002", "Password", 0.80),
     ]
     mock_qclient = MagicMock()
-    mock_qclient.search.return_value = hits
+    mock_response = MagicMock()
+    mock_response.points = hits
+    mock_qclient.query_points.return_value = mock_response
 
     with patch("it_agent.kb.search.QdrantClient", return_value=mock_qclient):
         result = await search_kb("VPN", settings, genai, limit=5)
@@ -102,7 +106,9 @@ async def test_search_kb_respects_limit():
 
     hits = [_make_hit(f"KB{i:03d}", f"Article {i}", 0.9 - i * 0.1) for i in range(10)]
     mock_qclient = MagicMock()
-    mock_qclient.search.return_value = hits
+    mock_response = MagicMock()
+    mock_response.points = hits
+    mock_qclient.query_points.return_value = mock_response
 
     with patch("it_agent.kb.search.QdrantClient", return_value=mock_qclient):
         result = await search_kb("query", settings, genai, limit=3)
