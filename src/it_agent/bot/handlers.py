@@ -24,6 +24,9 @@ _agent: Agent | None = None
 # ticket_id → (channel, thread_ts)
 _ticket_threads: dict[str, tuple[str, str]] = {}
 
+# Incident channel IDs the bot should actively respond in.
+_incident_channels: set[str] = set()
+
 
 def _get_agent(settings: Settings) -> Agent:
     global _agent
@@ -38,8 +41,12 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
     @app.event("app_mention")
     async def handle_mention(event: dict, say) -> None:
         """Handle @bot mentions in channels."""
-        # If the mention is in #help-it, skip — handle_message covers it.
-        if settings.help_channel_id and event.get("channel") == settings.help_channel_id:
+        # If the mention is in #help-it or an incident channel, skip —
+        # handle_message covers those so we don't double-respond.
+        channel = event.get("channel", "")
+        if settings.help_channel_id and channel == settings.help_channel_id:
+            return
+        if channel in _incident_channels:
             return
 
         # Strip the bot mention from the text
@@ -77,6 +84,11 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             await _handle_help_channel_message(event, text, say, settings)
             return
 
+        # Incident channels → continue conversation
+        if channel in _incident_channels:
+            await _handle_message(event, text, say, settings)
+            return
+
         # Other channels → ignore (handled by app_mention only)
 
     # Wire the resolution callback
@@ -86,6 +98,18 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         await post_resolution_update(ticket_id, ticket_data, settings)
 
     executor._on_ticket_resolved = _resolution_callback
+
+
+def _register_incident_channels(result: AgentResult) -> None:
+    """Track any incident channels created during this agent run."""
+    for tc in result.tool_calls:
+        if tc["name"] != "create_ticket":
+            continue
+        r = tc.get("result", {})
+        channel_id = r.get("channel_id")
+        if channel_id:
+            _incident_channels.add(channel_id)
+            logger.info("Registered incident channel %s", channel_id)
 
 
 async def _handle_message(event: dict, text: str, say, settings: Settings) -> None:
@@ -112,6 +136,8 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
         # Append assistant response to history
         history.append({"role": "assistant", "content": result.text})
+
+        _register_incident_channels(result)
 
         blocks = format_response_blocks(result.text)
         await say(text=result.text, blocks=blocks, thread_ts=thread_ts)
@@ -145,6 +171,8 @@ async def _handle_help_channel_message(
         result: AgentResult = await agent.run(history, user_id=user_id)
 
         history.append({"role": "assistant", "content": result.text})
+
+        _register_incident_channels(result)
 
         blocks = format_response_blocks(result.text)
         await say(text=result.text, blocks=blocks, thread_ts=thread_ts)

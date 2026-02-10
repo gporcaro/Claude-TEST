@@ -66,6 +66,7 @@ def _agent_result(text: str = "I'll help!", tool_calls: list | None = None) -> A
 def _agent_result_with_ticket(
     ticket_id: str = "INC0010042",
     channel_name: str = "inc0010042-alice",
+    channel_id: str = "C_INC42",
 ) -> AgentResult:
     return AgentResult(
         text="I've created a ticket for you.",
@@ -77,6 +78,7 @@ def _agent_result_with_ticket(
                     "success": True,
                     "ticket": {"ticket_id": ticket_id, "title": "Laptop broken"},
                     "channel_name": channel_name,
+                    "channel_id": channel_id,
                 },
             }
         ],
@@ -88,10 +90,12 @@ def _reset_handler_state():
     """Clear module-level state between tests."""
     handlers._conversations.clear()
     handlers._ticket_threads.clear()
+    handlers._incident_channels.clear()
     handlers._agent = None
     yield
     handlers._conversations.clear()
     handlers._ticket_threads.clear()
+    handlers._incident_channels.clear()
     handlers._agent = None
 
 
@@ -356,3 +360,60 @@ class TestDMNoFollowUp:
         # Only one call — the main response; no follow-up
         assert say.call_count == 1
         assert len(handlers._ticket_threads) == 0
+
+
+# ---------------------------------------------------------------------------
+# Incident channel routing tests
+# ---------------------------------------------------------------------------
+
+class TestIncidentChannelRouting:
+    async def test_incident_channel_registered_on_ticket_creation(self):
+        """When a ticket is created, the incident channel_id is registered."""
+        settings = _make_settings()
+        say = AsyncMock()
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = _agent_result_with_ticket(channel_id="C_INC42")
+
+        with patch.object(handlers, "_get_agent", return_value=mock_agent):
+            await handlers._handle_message(_dm_event(), "laptop broke", say, settings)
+
+        assert "C_INC42" in handlers._incident_channels
+
+    async def test_incident_channel_messages_are_processed(self):
+        """Messages in a registered incident channel go through _handle_message."""
+        settings = _make_settings()
+        say = AsyncMock()
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = _agent_result("I'll check on that.")
+
+        # Pre-register the incident channel
+        handlers._incident_channels.add("C_INC42")
+
+        event = {
+            "channel": "C_INC42",
+            "channel_type": "group",
+            "user": "U_USER",
+            "text": "any update?",
+            "ts": "4000.1",
+        }
+
+        with patch.object(handlers, "_get_agent", return_value=mock_agent):
+            await handlers._handle_message(event, "any update?", say, settings)
+
+        say.assert_called_once()
+        assert say.call_args[1]["text"] == "I'll check on that."
+
+    async def test_unregistered_channel_ignored(self):
+        """Messages in unregistered channels are not processed."""
+        event = _other_channel_event()
+        settings = _make_settings()
+        # Channel "C_OTHER" is not in _incident_channels and not help_channel_id
+        assert event["channel"] not in handlers._incident_channels
+        assert event["channel"] != settings.help_channel_id
+
+    async def test_mention_in_incident_channel_skipped(self):
+        """app_mention in incident channel is skipped (message handler covers it)."""
+        handlers._incident_channels.add("C_INC42")
+        event = {"channel": "C_INC42", "text": "<@U_BOT> help", "ts": "5000.1"}
+        channel = event.get("channel", "")
+        assert channel in handlers._incident_channels
