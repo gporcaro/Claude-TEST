@@ -36,9 +36,13 @@ Guidelines:
 When responding in the #help-it channel:
 - Be proactive: acknowledge the issue immediately and begin troubleshooting.
 - Run relevant diagnostics and search the knowledge base without waiting for the user to ask.
-- If the issue cannot be resolved via diagnostics or KB, proactively create a ticket — do not \
-wait for the user to request one.
+- **ALWAYS create a ticket for every new request** — even if you can resolve it immediately via \
+the knowledge base. Every interaction must be tracked. Create the ticket as your first action, \
+then continue troubleshooting.
 - Always include the ticket number and private channel name in your response.
+- When the user confirms the issue is resolved (e.g., "that worked", "all good", "this helped", \
+"that would be all"), **immediately resolve the ticket** using the update_ticket tool with \
+status "resolved" and a brief close_notes summary of what fixed it.
 """
 
 # Build Gemini function declarations from our TOOLS list at module level.
