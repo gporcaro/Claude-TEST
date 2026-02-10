@@ -7,7 +7,7 @@ TOOLS = [
         "description": (
             "Ping a hostname or IP address to check if it is reachable. Returns latency info."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "host": {
@@ -30,7 +30,7 @@ TOOLS = [
         "description": (
             "Perform a DNS lookup on a hostname. Returns resolved IP addresses and record info."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "hostname": {
@@ -50,7 +50,7 @@ TOOLS = [
     {
         "name": "check_disk_usage",
         "description": "Check disk usage on the system. Returns filesystem usage info.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "path": {
@@ -65,7 +65,7 @@ TOOLS = [
     {
         "name": "check_service_status",
         "description": "Check if a system service or process is running.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "service_name": {
@@ -82,7 +82,7 @@ TOOLS = [
     {
         "name": "create_ticket",
         "description": "Create a new IT support ticket.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Short title for the ticket"},
@@ -106,10 +106,13 @@ TOOLS = [
     {
         "name": "get_ticket",
         "description": "Retrieve an IT support ticket by its ID.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
-                "ticket_id": {"type": "integer", "description": "The ticket ID"},
+                "ticket_id": {
+                    "type": "string",
+                    "description": "ServiceNow incident number (e.g. 'INC0010001')",
+                },
             },
             "required": ["ticket_id"],
         },
@@ -120,10 +123,13 @@ TOOLS = [
             "Update an existing IT support ticket."
             " Can change status, priority, assignee, or add a comment."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
-                "ticket_id": {"type": "integer", "description": "The ticket ID to update"},
+                "ticket_id": {
+                    "type": "string",
+                    "description": "ServiceNow incident number (e.g. 'INC0010001')",
+                },
                 "status": {
                     "type": "string",
                     "enum": ["open", "in_progress", "waiting", "resolved", "closed"],
@@ -134,6 +140,13 @@ TOOLS = [
                 },
                 "assignee_id": {"type": "string", "description": "Slack user ID of assignee"},
                 "comment": {"type": "string", "description": "Comment to add to the ticket"},
+                "close_notes": {
+                    "type": "string",
+                    "description": (
+                        "Resolution notes (required when setting status to"
+                        " 'resolved' or 'closed')"
+                    ),
+                },
             },
             "required": ["ticket_id"],
         },
@@ -141,7 +154,7 @@ TOOLS = [
     {
         "name": "list_tickets",
         "description": "List IT support tickets with optional filters.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "status": {
@@ -175,7 +188,7 @@ TOOLS = [
             " Use this to find solutions, documentation, and procedures"
             " for common IT issues."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "query": {

@@ -1,58 +1,77 @@
-"""Tests for knowledge base indexer and search."""
+"""Tests for the knowledge base search tool wrapper."""
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from it_agent.knowledge.indexer import _split_markdown, index_docs
-from it_agent.knowledge.store import search
+import pytest  # noqa: F401
+
+from it_agent.tools.knowledge import search_knowledge_base
+
+# --- Helpers ---
+
+def _make_settings():
+    s = MagicMock()
+    s.gemini_api_key = "test-key"
+    s.qdrant_url = "http://localhost:6333"
+    s.qdrant_collection = "it_kb"
+    return s
 
 
-class TestSplitMarkdown:
-    def test_splits_on_headers(self):
-        text = "# Title\nSome content\n## Section\nMore content"
-        chunks = _split_markdown(text, "test")
-        assert len(chunks) == 2
-        assert "Title" in chunks[0]["content"]
-        assert "Section" in chunks[1]["content"]
+# --- Tests ---
 
-    def test_preserves_metadata(self):
-        text = "# My Doc\nContent here"
-        chunks = _split_markdown(text, "my-doc")
-        assert chunks[0]["metadata"]["source"] == "my-doc"
-        assert chunks[0]["metadata"]["title"] == "My Doc"
-
-    def test_empty_text(self):
-        chunks = _split_markdown("", "empty")
-        assert chunks == []
-
-    def test_no_headers(self):
-        text = "Just some plain text without headers"
-        chunks = _split_markdown(text, "plain")
-        assert len(chunks) == 1
+@pytest.mark.asyncio
+async def test_search_knowledge_base_no_settings():
+    result = await search_knowledge_base("VPN")
+    assert result == {"error": "Settings not configured"}
 
 
 @pytest.mark.asyncio
-async def test_index_and_search(tmp_path):
-    # Create test docs
-    docs_dir = tmp_path / "docs"
-    docs_dir.mkdir()
-    (docs_dir / "test.md").write_text("# VPN Setup\nHow to set up VPN on your laptop")
+async def test_search_knowledge_base_returns_results():
+    settings = _make_settings()
+    mock_result = {
+        "results": [
+            {"id": "KB001", "title": "VPN Setup", "content": "...", "score": 0.95}
+        ],
+        "count": 1,
+        "error": None,
+    }
 
-    chroma_dir = tmp_path / "chroma"
+    with patch("it_agent.tools.knowledge.search_kb", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = mock_result
+        with patch("it_agent.tools.knowledge.genai") as mock_genai:
+            mock_genai.Client.return_value = MagicMock()
+            result = await search_knowledge_base("VPN", _settings=settings)
 
-    # Index
-    count = index_docs(docs_dir, chroma_dir)
-    assert count > 0
-
-    # Search
-    results = await search(chroma_dir, "VPN setup", n_results=1)
-    assert len(results) > 0
-    assert "VPN" in results[0]["content"]
+    assert result["count"] == 1
+    assert result["results"][0]["id"] == "KB001"
 
 
 @pytest.mark.asyncio
-async def test_search_empty_collection(tmp_path):
-    chroma_dir = tmp_path / "empty_chroma"
-    results = await search(chroma_dir, "anything", n_results=1)
-    assert results == []
+async def test_search_knowledge_base_no_results():
+    settings = _make_settings()
+    mock_result = {"results": [], "count": 0, "error": None}
+
+    with patch("it_agent.tools.knowledge.search_kb", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = mock_result
+        with patch("it_agent.tools.knowledge.genai") as mock_genai:
+            mock_genai.Client.return_value = MagicMock()
+            result = await search_knowledge_base("obscure", _settings=settings)
+
+    assert result["results"] == []
+    assert "No matching articles" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_search_knowledge_base_qdrant_error():
+    settings = _make_settings()
+    mock_result = {"results": [], "count": 0, "error": "Connection refused"}
+
+    with patch("it_agent.tools.knowledge.search_kb", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = mock_result
+        with patch("it_agent.tools.knowledge.genai") as mock_genai:
+            mock_genai.Client.return_value = MagicMock()
+            result = await search_knowledge_base("VPN", _settings=settings)
+
+    assert "temporarily unavailable" in result["message"]
+    assert result["results"] == []

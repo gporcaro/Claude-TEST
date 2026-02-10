@@ -1,11 +1,13 @@
-"""Claude agent core — tool loop that drives the AI."""
+"""Gemini agent core — tool loop that drives the AI."""
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 
-import anthropic
+from google import genai
+from google.genai import types
 
 from it_agent.agent.executor import execute_tool
 from it_agent.agent.tools import TOOLS
@@ -30,78 +32,116 @@ Guidelines:
 - Always confirm actions with the user (e.g., "I've created ticket #5 for your issue").
 - If you can't resolve an issue, create a ticket and let the user know.
 - Format responses for Slack using markdown (*bold*, `code`, bullet points).
+
+When responding in the #help-it channel:
+- Be proactive: acknowledge the issue immediately and begin troubleshooting.
+- Run relevant diagnostics and search the knowledge base without waiting for the user to ask.
+- If the issue cannot be resolved via diagnostics or KB, proactively create a ticket — do not \
+wait for the user to request one.
+- Always include the ticket number and private channel name in your response.
 """
+
+# Build Gemini function declarations from our TOOLS list at module level.
+GEMINI_TOOLS = [
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=t["parameters"],
+            )
+            for t in TOOLS
+        ]
+    )
+]
+
+
+@dataclass
+class AgentResult:
+    """Structured result from an agent run."""
+
+    text: str
+    tool_calls: list[dict] = field(default_factory=list)
+    # Each entry: {"name": "create_ticket", "args": {...}, "result": {...}}
 
 
 class Agent:
-    """Claude-powered IT support agent with tool use."""
+    """Gemini-powered IT support agent with tool use."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.claude_model
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.model = settings.gemini_model
         self.max_loops = settings.max_tool_loops
 
-    async def run(self, messages: list[dict], user_id: str = "unknown") -> str:
-        """Run the agent tool loop and return the final text response."""
-        # Build messages for Claude (only role + content)
-        claude_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-
-        for loop_idx in range(self.max_loops):
-            logger.debug("Agent loop %d, sending %d messages", loop_idx, len(claude_messages))
-
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=claude_messages,
+    async def run(self, messages: list[dict], user_id: str = "unknown") -> AgentResult:
+        """Run the agent tool loop and return a structured AgentResult."""
+        # Convert incoming messages to Gemini Content objects.
+        gemini_contents: list[types.Content] = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            gemini_contents.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
             )
 
-            # If the model wants to stop, extract text and return
-            if response.stop_reason == "end_turn":
-                return _extract_text(response)
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=GEMINI_TOOLS,
+        )
 
-            # If the model wants to use tools, execute them
-            if response.stop_reason == "tool_use":
-                # Add the assistant message with all content blocks
-                claude_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response.content,
-                    }
+        all_tool_calls: list[dict] = []
+
+        for loop_idx in range(self.max_loops):
+            logger.debug("Agent loop %d, sending %d messages", loop_idx, len(gemini_contents))
+
+            response = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=gemini_contents,
+                config=config,
+            )
+
+            # If no function calls, the model is done — return the text.
+            if not response.function_calls:
+                return AgentResult(text=_extract_text(response), tool_calls=all_tool_calls)
+
+            # The model wants to call tools — add its response as a model turn.
+            gemini_contents.append(response.candidates[0].content)
+
+            # Execute each function call and collect results.
+            function_responses: list[types.Part] = []
+            for fc in response.function_calls:
+                logger.info("Executing tool: %s(%s)", fc.name, json.dumps(fc.args))
+                result = await execute_tool(fc.name, fc.args, self.settings, user_id)
+
+                result_parsed = json.loads(result)
+                all_tool_calls.append({
+                    "name": fc.name,
+                    "args": dict(fc.args) if fc.args else {},
+                    "result": result_parsed,
+                })
+
+                function_responses.append(
+                    types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": result},
+                    )
                 )
 
-                # Execute each tool call and build tool results
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        logger.info("Executing tool: %s(%s)", block.name, json.dumps(block.input))
-                        result = await execute_tool(block.name, block.input, self.settings, user_id)
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result,
-                            }
-                        )
-
-                claude_messages.append({"role": "user", "content": tool_results})
-            else:
-                # Unexpected stop reason, return whatever text we have
-                return _extract_text(response)
+            # Add tool results as a user turn.
+            gemini_contents.append(types.Content(role="user", parts=function_responses))
 
         # Safety: max loops reached
-        return (
-            "I've reached my processing limit for this request. "
-            "Please try breaking your question into smaller parts."
+        return AgentResult(
+            text=(
+                "I've reached my processing limit for this request. "
+                "Please try breaking your question into smaller parts."
+            ),
+            tool_calls=all_tool_calls,
         )
 
 
 def _extract_text(response) -> str:
-    """Extract text content from a Claude response."""
-    parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    return "\n".join(parts) if parts else "I processed your request but have no text to display."
+    """Extract text content from a Gemini response."""
+    if response.text:
+        return response.text
+    return "I processed your request but have no text to display."
