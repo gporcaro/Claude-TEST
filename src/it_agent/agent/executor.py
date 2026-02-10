@@ -32,6 +32,10 @@ _TOOL_HANDLERS = {
 # Signature: async (ticket_id: str, ticket_data: dict, settings: Settings) -> None
 _on_ticket_resolved: Callable | None = None
 
+# Assignment callback — set by handlers.py to invite assignees to incident channels.
+# Signature: async (ticket_id: str, assignee_id: str, settings: Settings) -> None
+_on_ticket_assigned: Callable | None = None
+
 
 async def execute_tool(
     tool_name: str, tool_input: dict, settings: Settings, user_id: str = "unknown"
@@ -72,6 +76,22 @@ async def execute_tool(
                 except Exception:
                     logger.exception(
                         "Resolution callback failed for %s", tool_input.get("ticket_id")
+                    )
+
+        # Fire assignment callback when a ticket is assigned
+        if (
+            tool_name == "update_ticket"
+            and result.get("success")
+            and _on_ticket_assigned is not None
+        ):
+            assignee_id = args.get("assignee_id", "")
+            if assignee_id:
+                try:
+                    ticket_id = args.get("ticket_id", "")
+                    await _on_ticket_assigned(ticket_id, assignee_id, settings)
+                except Exception:
+                    logger.exception(
+                        "Assignment callback failed for %s", tool_input.get("ticket_id")
                     )
 
         return result_str

@@ -17,6 +17,7 @@ from it_agent.bot.formatters import (
 )
 from it_agent.config import Settings
 from it_agent.servicenow.client import ServiceNowClient
+from it_agent.tools.users import resolve_sn_user_to_slack
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,13 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         await post_resolution_update(ticket_id, ticket_data, settings)
 
     executor._on_ticket_resolved = _resolution_callback
+
+    async def _assignment_callback(
+        ticket_id: str, assignee_id: str, settings: Settings
+    ) -> None:
+        await _handle_ticket_assigned(ticket_id, assignee_id, settings)
+
+    executor._on_ticket_assigned = _assignment_callback
 
 
 def _register_incident_channels(result: AgentResult) -> None:
@@ -661,6 +669,59 @@ async def post_resolution_update(
     # Schedule auto-close after 48 hours
     _resolved_pending_close[ticket_id] = time.time()
     logger.info("Ticket %s queued for auto-close in 48h", ticket_id)
+
+
+async def _handle_ticket_assigned(
+    ticket_id: str, assignee_sn_sys_id: str, settings: Settings
+) -> None:
+    """Invite the assigned user to the incident Slack channel and post a notification."""
+    # Reverse-lookup: find channel_id whose context has this ticket_id
+    channel_id: str | None = None
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            channel_id = ch_id
+            break
+
+    if channel_id is None:
+        logger.debug("No incident channel found for ticket %s — skipping invite", ticket_id)
+        return
+
+    # Resolve ServiceNow sys_id → Slack user
+    slack_user = await resolve_sn_user_to_slack(assignee_sn_sys_id, settings)
+    if slack_user is None:
+        logger.info(
+            "Could not resolve SN user %s to Slack — skipping invite for %s",
+            assignee_sn_sys_id, ticket_id,
+        )
+        return
+
+    slack_id = slack_user["slack_id"]
+    real_name = slack_user["real_name"]
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    # Invite the assignee to the channel
+    try:
+        await client.conversations_invite(channel=channel_id, users=slack_id)
+        logger.info("Invited %s (%s) to incident channel %s", real_name, slack_id, channel_id)
+    except Exception as exc:
+        # Handle "already_in_channel" gracefully
+        if "already_in_channel" in str(exc):
+            logger.debug("%s is already in channel %s", slack_id, channel_id)
+        else:
+            logger.warning(
+                "Failed to invite %s to channel %s", slack_id, channel_id, exc_info=True,
+            )
+
+    # Post assignment notification
+    try:
+        await client.chat_postMessage(
+            channel=channel_id,
+            text=f":bust_in_silhouette: *{real_name}* has been assigned to this incident.",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to post assignment message in %s", channel_id, exc_info=True,
+        )
 
 
 async def _rename_incident_channel_resolved(

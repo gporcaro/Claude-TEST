@@ -12,6 +12,74 @@ from it_agent.servicenow.client import ServiceNowClient
 logger = logging.getLogger(__name__)
 
 
+async def resolve_sn_user_to_slack(
+    sn_sys_id: str,
+    settings: Settings,
+) -> dict | None:
+    """Resolve a ServiceNow sys_id to a Slack user.
+
+    Queries the ServiceNow ``sys_user`` table for the email/name associated with
+    *sn_sys_id*, then searches the Slack workspace for a user whose
+    ``profile.email`` matches exactly.
+
+    Returns ``{"slack_id": ..., "real_name": ..., "email": ...}`` or *None*.
+    """
+    # 1. Fetch email & name from ServiceNow
+    sn_client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password
+    )
+    try:
+        resp = await sn_client._client.get(
+            f"{sn_client.base_url}/table/sys_user",
+            params={
+                "sysparm_query": f"sys_id={sn_sys_id}",
+                "sysparm_limit": "1",
+                "sysparm_fields": "sys_id,name,email",
+            },
+        )
+        resp.raise_for_status()
+        results = resp.json().get("result", [])
+        if not results:
+            logger.warning("No ServiceNow user found for sys_id %s", sn_sys_id)
+            return None
+        sn_email = results[0].get("email", "").lower()
+        sn_name = results[0].get("name", "")
+        if not sn_email:
+            logger.warning("ServiceNow user %s has no email", sn_sys_id)
+            return None
+    except Exception:
+        logger.warning("Failed to fetch SN user %s", sn_sys_id, exc_info=True)
+        return None
+    finally:
+        await sn_client.close()
+
+    # 2. Search Slack for a user with the same email
+    slack = AsyncWebClient(token=settings.slack_bot_token)
+    try:
+        cursor = None
+        while True:
+            resp = await slack.users_list(limit=200, cursor=cursor)
+            for member in resp.get("members", []):
+                if member.get("deleted") or member.get("is_bot"):
+                    continue
+                profile = member.get("profile", {})
+                if profile.get("email", "").lower() == sn_email:
+                    return {
+                        "slack_id": member["id"],
+                        "real_name": profile.get("real_name", sn_name),
+                        "email": sn_email,
+                    }
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        logger.warning("Slack user search failed for email %s", sn_email, exc_info=True)
+        return None
+
+    logger.info("No Slack user found for SN user %s (%s)", sn_sys_id, sn_email)
+    return None
+
+
 async def lookup_user(
     name: str,
     _settings: Settings | None = None,

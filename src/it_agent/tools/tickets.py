@@ -66,8 +66,21 @@ async def create_ticket(
         )
         channel_id = channel_resp["channel"]["id"]
 
-        # Invite the requester to the channel
-        await slack.conversations_invite(channel=channel_id, users=_user_id)
+        result["channel_name"] = channel_name
+        result["channel_id"] = channel_id
+
+        # Invite the requester to the channel (isolated so a failure here
+        # does not prevent the summary message from being posted).
+        try:
+            await slack.conversations_invite(channel=channel_id, users=_user_id)
+        except Exception as exc:
+            if "already_in_channel" in str(exc):
+                logger.debug("Requester %s already in channel %s", _user_id, channel_id)
+            else:
+                logger.warning(
+                    "Failed to invite requester %s to channel %s: %s",
+                    _user_id, channel_id, exc,
+                )
 
         # Post initial message with incident summary + ServiceNow link
         sn_link = (
@@ -82,9 +95,6 @@ async def create_ticket(
             f"<{sn_link}|View in ServiceNow>"
         )
         msg_resp = await slack.chat_postMessage(channel=channel_id, text=message)
-
-        result["channel_name"] = channel_name
-        result["channel_id"] = channel_id
         result["summary_ts"] = msg_resp["ts"]
     except Exception:
         logger.warning(
