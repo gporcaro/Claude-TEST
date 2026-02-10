@@ -54,6 +54,52 @@ def _get_agent(settings: Settings) -> Agent:
     return _agent
 
 
+async def _recover_thread_history(
+    channel: str, thread_ts: str, settings: Settings, bot_user_id: str | None = None,
+) -> list[dict]:
+    """Fetch a Slack thread's messages and rebuild conversation history.
+
+    Called when the bot has no in-memory history for a thread (e.g. after restart).
+    Returns a list of ``{role, content}`` dicts ready for the agent.
+    """
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+
+        # Resolve bot's own user ID so we can tag its messages as "assistant"
+        if bot_user_id is None:
+            auth = await client.auth_test()
+            bot_user_id = auth["user_id"]
+
+        resp = await client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=MAX_HISTORY,
+        )
+        messages = resp.get("messages", [])
+
+        history: list[dict] = []
+        for msg in messages:
+            # Skip subtypes (joins, topic changes, etc.)
+            if msg.get("subtype"):
+                continue
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+
+            if msg.get("user") == bot_user_id or msg.get("bot_id"):
+                history.append({"role": "assistant", "content": text})
+            else:
+                history.append({"role": "user", "content": text})
+
+        if history:
+            logger.info(
+                "Recovered %d messages for thread %s in channel %s",
+                len(history), thread_ts, channel,
+            )
+        return history
+    except Exception:
+        logger.warning("Failed to recover thread history", exc_info=True)
+        return []
+
+
 def _parse_incident_message(text: str) -> dict:
     """Extract incident fields from the bot's initial channel message."""
     ctx: dict[str, str] = {}
@@ -223,9 +269,20 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     # Build conversation key
     conv_key = (channel, thread_ts)
 
-    # Get or init history
-    history = _conversations.setdefault(conv_key, [])
-    history.append({"role": "user", "content": text})
+    # Recover history from Slack if we have none (e.g. after bot restart)
+    if conv_key not in _conversations:
+        recovered = await _recover_thread_history(channel, thread_ts, settings)
+        if recovered:
+            # The last message in recovered history is the current message,
+            # so we use the recovered history directly
+            _conversations[conv_key] = recovered
+            history = _conversations[conv_key]
+        else:
+            _conversations[conv_key] = [{"role": "user", "content": text}]
+            history = _conversations[conv_key]
+    else:
+        history = _conversations[conv_key]
+        history.append({"role": "user", "content": text})
 
     # Trim old history
     if len(history) > MAX_HISTORY:
@@ -374,8 +431,19 @@ async def _handle_help_channel_message(
     user_id = event.get("user", "unknown")
 
     conv_key = (channel, thread_ts)
-    history = _conversations.setdefault(conv_key, [])
-    history.append({"role": "user", "content": text})
+
+    # Recover history from Slack if we have none (e.g. after bot restart)
+    if conv_key not in _conversations:
+        recovered = await _recover_thread_history(channel, thread_ts, settings)
+        if recovered:
+            _conversations[conv_key] = recovered
+            history = _conversations[conv_key]
+        else:
+            _conversations[conv_key] = [{"role": "user", "content": text}]
+            history = _conversations[conv_key]
+    else:
+        history = _conversations[conv_key]
+        history.append({"role": "user", "content": text})
 
     if len(history) > MAX_HISTORY:
         _conversations[conv_key] = history[-MAX_HISTORY:]
