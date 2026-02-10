@@ -462,6 +462,12 @@ async def _handle_help_channel_message(
         blocks = format_response_blocks(result.text, sn_url)
         await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
+        # Collect KB results from this run
+        kb_results: list[dict] = []
+        for tc in result.tool_calls:
+            if tc["name"] == "search_knowledge_base":
+                kb_results.extend(tc.get("result", {}).get("results", []))
+
         # Post threaded follow-ups for any tickets created during this run
         for tc in result.tool_calls:
             if tc["name"] != "create_ticket":
@@ -473,6 +479,7 @@ async def _handle_help_channel_message(
             ticket = r.get("ticket", {})
             ticket_id = ticket.get("ticket_id", "")
             channel_name = r.get("channel_name", "")
+            channel_id = r.get("channel_id", "")
 
             if not ticket_id:
                 continue
@@ -492,12 +499,56 @@ async def _handle_help_channel_message(
             followup = linkify_servicenow_refs(followup, sn_url)
             await say(text=followup, thread_ts=thread_ts)
 
+            # Post KB article content in the incident channel
+            if kb_results and channel_id:
+                await _post_kb_results_to_channel(
+                    channel_id, kb_results, settings,
+                )
+
     except Exception:
         logger.exception("Error processing #help-it message")
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
         await say(text="Error processing request", blocks=blocks, thread_ts=thread_ts)
+
+
+async def _post_kb_results_to_channel(
+    channel_id: str, kb_results: list[dict], settings: Settings,
+) -> None:
+    """Post KB article references and content in the incident channel."""
+    sn_url = settings.sn_instance_url
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    for article in kb_results:
+        article_id = article.get("id", "")
+        title = article.get("title", "Untitled")
+        content = article.get("content", "")
+        source = article.get("source", "")
+
+        # Skip internal articles — they can inform the agent but shouldn't
+        # be shared directly with users.
+        if content.strip().upper().startswith("INTERNAL"):
+            continue
+
+        # Build the message
+        if article_id.startswith("KB"):
+            header = f":book: *{article_id} — {title}*"
+        elif source == "local":
+            header = f":book: *{title}*"
+        else:
+            header = f":book: *{article_id} — {title}*"
+
+        message = f"{header}\n\n{content}"
+        message = linkify_servicenow_refs(message, sn_url)
+
+        try:
+            await client.chat_postMessage(channel=channel_id, text=message)
+        except Exception:
+            logger.warning(
+                "Failed to post KB article %s to channel %s", article_id, channel_id,
+                exc_info=True,
+            )
 
 
 async def post_resolution_update(
