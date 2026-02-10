@@ -10,6 +10,7 @@ from it_agent.config import Settings
 from it_agent.tools.diagnostics import check_disk_usage, check_service_status, dns_lookup, ping_host
 from it_agent.tools.knowledge import search_knowledge_base
 from it_agent.tools.tickets import create_ticket, get_ticket, list_tickets, update_ticket
+from it_agent.tools.users import lookup_user
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ _TOOL_HANDLERS = {
     "update_ticket": update_ticket,
     "list_tickets": list_tickets,
     "search_knowledge_base": search_knowledge_base,
+    "lookup_user": lookup_user,
 }
 
 # Resolution callback — set by handlers.py to post updates back to #help-it.
@@ -49,7 +51,7 @@ async def execute_tool(
             args["_user_id"] = user_id
         elif tool_name in ("get_ticket", "list_tickets"):
             args["_settings"] = settings
-        elif tool_name == "search_knowledge_base":
+        elif tool_name in ("search_knowledge_base", "lookup_user"):
             args["_settings"] = settings
 
         result = await handler(**args)

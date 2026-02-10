@@ -138,7 +138,13 @@ TOOLS = [
                     "type": "string",
                     "enum": ["low", "medium", "high", "critical"],
                 },
-                "assignee_id": {"type": "string", "description": "Slack user ID of assignee"},
+                "assignee_id": {
+                    "type": "string",
+                    "description": (
+                        "ServiceNow sys_id of the assignee. Use the lookup_user tool "
+                        "first to resolve a person's name to their servicenow_sys_id."
+                    ),
+                },
                 "comment": {"type": "string", "description": "Comment to add to the ticket"},
                 "close_notes": {
                     "type": "string",
@@ -202,6 +208,29 @@ TOOLS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    # --- User Lookup ---
+    {
+        "name": "lookup_user",
+        "description": (
+            "Search for a user by name (partial or full) across Slack and ServiceNow. "
+            "Returns matching candidates with their Slack user ID, ServiceNow sys_id, "
+            "display name, and email. Use this when you need to assign a ticket to "
+            "someone by name, or identify a user mentioned in conversation. "
+            "If multiple matches are found, ask the requester to confirm which user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Name to search for (e.g. 'John', 'John Smith', 'jsmith')"
+                    ),
+                },
+            },
+            "required": ["name"],
         },
     },
 ]
