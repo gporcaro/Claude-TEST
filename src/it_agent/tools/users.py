@@ -60,39 +60,85 @@ async def lookup_user(
         logger.warning("Slack user search failed", exc_info=True)
         return {"error": "Failed to search Slack users"}
 
-    if not candidates:
-        return {
-            "candidates": [],
-            "message": f"No Slack users found matching '{name}'.",
-        }
-
-    # 2. Look up ServiceNow sys_id for each candidate via email
+    # 2. Look up ServiceNow sys_id for each candidate via email, then by name.
+    #    If no Slack candidates, search ServiceNow directly by name.
     sn_client = ServiceNowClient(
         _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
     )
     try:
-        for candidate in candidates:
-            email = candidate.get("email", "")
-            if not email:
-                candidate["servicenow_sys_id"] = None
-                continue
+        # If no Slack matches, search ServiceNow directly by name
+        if not candidates:
             try:
                 resp = await sn_client._client.get(
                     f"{sn_client.base_url}/table/sys_user",
                     params={
-                        "sysparm_query": f"email={email}",
-                        "sysparm_limit": "1",
+                        "sysparm_query": f"nameLIKE{name}^active=true",
+                        "sysparm_limit": "5",
                         "sysparm_fields": "sys_id,name,email",
                     },
                 )
                 resp.raise_for_status()
-                results = resp.json().get("result", [])
-                if results:
-                    candidate["servicenow_sys_id"] = results[0]["sys_id"]
-                else:
-                    candidate["servicenow_sys_id"] = None
+                for sn_user in resp.json().get("result", []):
+                    candidates.append({
+                        "slack_id": None,
+                        "real_name": sn_user.get("name", ""),
+                        "display_name": "",
+                        "email": sn_user.get("email", ""),
+                        "servicenow_sys_id": sn_user["sys_id"],
+                        "source": "servicenow",
+                    })
             except Exception:
+                logger.debug("SN direct name lookup failed for %s", name)
+
+            if not candidates:
+                return {
+                    "candidates": [],
+                    "message": f"No users found matching '{name}' in Slack or ServiceNow.",
+                }
+        else:
+            # Enrich Slack candidates with ServiceNow sys_id
+            for candidate in candidates:
                 candidate["servicenow_sys_id"] = None
+
+                # Try email first
+                email = candidate.get("email", "")
+                if email:
+                    try:
+                        resp = await sn_client._client.get(
+                            f"{sn_client.base_url}/table/sys_user",
+                            params={
+                                "sysparm_query": f"email={email}",
+                                "sysparm_limit": "1",
+                                "sysparm_fields": "sys_id,name,email",
+                            },
+                        )
+                        resp.raise_for_status()
+                        results = resp.json().get("result", [])
+                        if results:
+                            candidate["servicenow_sys_id"] = results[0]["sys_id"]
+                    except Exception:
+                        logger.debug("SN email lookup failed for %s", email)
+
+                # Fallback: search by name if email didn't match
+                if not candidate["servicenow_sys_id"]:
+                    real_name = candidate.get("real_name", "")
+                    if real_name:
+                        try:
+                            resp = await sn_client._client.get(
+                                f"{sn_client.base_url}/table/sys_user",
+                                params={
+                                    "sysparm_query": f"nameLIKE{real_name}",
+                                    "sysparm_limit": "1",
+                                    "sysparm_fields": "sys_id,name,email",
+                                },
+                            )
+                            resp.raise_for_status()
+                            results = resp.json().get("result", [])
+                            if results:
+                                candidate["servicenow_sys_id"] = results[0]["sys_id"]
+                                candidate["servicenow_name"] = results[0].get("name", "")
+                        except Exception:
+                            logger.debug("SN name lookup failed for %s", real_name)
     finally:
         await sn_client.close()
 
