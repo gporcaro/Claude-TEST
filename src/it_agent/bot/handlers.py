@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timezone
 
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
@@ -174,6 +175,10 @@ async def discover_incident_channels(settings: Settings) -> None:
 
         # Fetch context from the first bot message in each channel.
         # Fall back to extracting the ticket ID from the channel name.
+        # Also track channels whose name ends with "-resolved" so we can
+        # recover auto-close tracking after a restart.
+        resolved_ticket_ids: list[str] = []
+
         for ch_id in channel_ids:
             try:
                 info = await client.conversations_info(channel=ch_id)
@@ -216,14 +221,51 @@ async def discover_incident_channels(settings: Settings) -> None:
                             "Seeded incident context for %s from channel name (%s)",
                             ch_name, ticket_id,
                         )
+
+                # Track resolved channels for auto-close recovery
+                if ch_name.endswith("-resolved"):
+                    tid = _incident_context.get(ch_id, {}).get("ticket_id")
+                    if tid:
+                        resolved_ticket_ids.append(tid)
+
             except Exception:
                 logger.debug("Could not fetch history for channel %s", ch_id)
 
+        # Recover auto-close tracking for resolved channels so the 48h
+        # countdown survives bot restarts.
+        if resolved_ticket_ids:
+            sn_client = ServiceNowClient(
+                settings.sn_instance_url, settings.sn_username, settings.sn_password,
+            )
+            try:
+                for tid in resolved_ticket_ids:
+                    if tid in _resolved_pending_close:
+                        continue
+                    try:
+                        incident = await sn_client.get_incident(tid)
+                        if incident is None or incident.get("status") != "resolved":
+                            continue
+                        updated_str = incident.get("updated_at", "")
+                        if updated_str:
+                            resolved_dt = datetime.strptime(
+                                updated_str, "%Y-%m-%d %H:%M:%S",
+                            ).replace(tzinfo=timezone.utc)
+                            _resolved_pending_close[tid] = resolved_dt.timestamp()
+                            logger.info(
+                                "Recovered auto-close tracking for %s (resolved at %s)",
+                                tid, updated_str,
+                            )
+                    except Exception:
+                        logger.debug("Could not check SN status for %s", tid)
+            finally:
+                await sn_client.close()
+
         if _incident_channels:
             logger.info(
-                "Discovered %d incident channel(s) on startup (%d with context)",
+                "Discovered %d incident channel(s) on startup (%d with context, %d pending auto-close)",
                 len(_incident_channels),
                 len(_incident_context),
+                len(_resolved_pending_close),
             )
     except Exception:
         logger.warning("Failed to discover incident channels", exc_info=True)
