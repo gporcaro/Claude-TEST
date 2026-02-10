@@ -16,7 +16,7 @@ from it_agent.servicenow.client import ServiceNowClient
 
 logger = logging.getLogger(__name__)
 
-_VECTOR_DIM = 768
+_VECTOR_DIM = 3072
 _CHUNK_WORDS = 500
 _OVERLAP_WORDS = 50
 _UPSERT_BATCH = 100

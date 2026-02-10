@@ -7,7 +7,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "models/text-embedding-004"
+_MODEL = "models/gemini-embedding-001"
 
 
 async def embed_texts(
