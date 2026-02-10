@@ -154,6 +154,8 @@ class ServiceNowClient:
             payload["urgency"] = _PRIORITY_TO_URGENCY.get(data["priority"], "2")
         if "assignee_id" in data:
             payload["assigned_to"] = data["assignee_id"]
+        if "requester_id" in data:
+            payload["caller_id"] = data["requester_id"]
         if "comment" in data:
             payload["comments"] = data["comment"]
 

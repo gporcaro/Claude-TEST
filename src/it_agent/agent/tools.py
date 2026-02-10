@@ -121,7 +121,7 @@ TOOLS = [
         "name": "update_ticket",
         "description": (
             "Update an existing IT support ticket."
-            " Can change status, priority, assignee, or add a comment."
+            " Can change status, priority, assignee, requester, or add a comment."
         ),
         "parameters": {
             "type": "object",
@@ -143,6 +143,13 @@ TOOLS = [
                     "description": (
                         "ServiceNow sys_id of the assignee. Use the lookup_user tool "
                         "first to resolve a person's name to their servicenow_sys_id."
+                    ),
+                },
+                "requester_id": {
+                    "type": "string",
+                    "description": (
+                        "ServiceNow sys_id of the requester (caller). Use the lookup_user "
+                        "tool first to resolve a person's name to their servicenow_sys_id."
                     ),
                 },
                 "comment": {"type": "string", "description": "Comment to add to the ticket"},

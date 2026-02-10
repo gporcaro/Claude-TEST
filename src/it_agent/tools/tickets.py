@@ -25,6 +25,37 @@ async def create_ticket(
     if _settings is None:
         return {"error": "Settings not configured"}
 
+    # Resolve Slack user ID → ServiceNow sys_id for the caller field.
+    # Fall back to the raw Slack ID if resolution fails.
+    caller_id = _user_id
+    if _user_id and _user_id != "unknown":
+        try:
+            slack = AsyncWebClient(token=_settings.slack_bot_token)
+            user_info = await slack.users_info(user=_user_id)
+            email = user_info.get("user", {}).get("profile", {}).get("email", "")
+            if email:
+                sn_client = ServiceNowClient(
+                    _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
+                )
+                try:
+                    resp = await sn_client._client.get(
+                        f"{sn_client.base_url}/table/sys_user",
+                        params={
+                            "sysparm_query": f"email={email}",
+                            "sysparm_limit": "1",
+                            "sysparm_fields": "sys_id",
+                        },
+                    )
+                    resp.raise_for_status()
+                    results = resp.json().get("result", [])
+                    if results:
+                        caller_id = results[0]["sys_id"]
+                        logger.info("Resolved caller %s → SN sys_id %s", _user_id, caller_id)
+                finally:
+                    await sn_client.close()
+        except Exception:
+            logger.warning("Could not resolve Slack user %s to SN sys_id", _user_id, exc_info=True)
+
     client = ServiceNowClient(
         _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
     )
@@ -35,7 +66,7 @@ async def create_ticket(
                 "description": description,
                 "priority": priority,
                 "category": category,
-                "caller_id": _user_id,
+                "caller_id": caller_id,
             }
         )
     finally:
@@ -132,6 +163,7 @@ async def update_ticket(
     status: str | None = None,
     priority: str | None = None,
     assignee_id: str | None = None,
+    requester_id: str | None = None,
     comment: str | None = None,
     close_notes: str | None = None,
     _settings: Settings | None = None,
@@ -158,6 +190,8 @@ async def update_ticket(
             update_data["priority"] = priority
         if assignee_id:
             update_data["assignee_id"] = assignee_id
+        if requester_id:
+            update_data["requester_id"] = requester_id
         if comment:
             update_data["comment"] = comment
         if close_notes:
