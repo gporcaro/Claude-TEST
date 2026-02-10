@@ -113,6 +113,10 @@ def _prepare_chunks(articles: list[dict]) -> list[dict]:
         if source != "local":
             raw_content = _strip_html(raw_content)
 
+        raw_content = raw_content.strip()
+        if not raw_content:
+            continue
+
         chunks = _chunk_text(raw_content)
         for i, chunk_text in enumerate(chunks):
             all_chunks.append({
@@ -156,6 +160,8 @@ async def index_knowledge_base(
 
     # 2. Chunk
     chunks = _prepare_chunks(all_articles)
+    # Filter out any chunks with empty text (Gemini rejects empty strings)
+    chunks = [c for c in chunks if c["full_text"].strip()]
     logger.info("Created %d chunks from %d articles", len(chunks), len(all_articles))
 
     # 3. Embed

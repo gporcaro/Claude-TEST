@@ -34,11 +34,12 @@ async def search_kb(
 
         # 2. Search Qdrant (over-fetch to handle chunk dedup)
         qclient = QdrantClient(url=settings.qdrant_url)
-        hits = qclient.search(
+        response = qclient.query_points(
             collection_name=settings.qdrant_collection,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit * 3,
         )
+        hits = response.points
 
         # 3. Deduplicate by article_id, keep best score per article
         seen: dict[str, dict] = {}

@@ -8,7 +8,11 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from it_agent.agent import executor
 from it_agent.agent.core import Agent, AgentResult
-from it_agent.bot.formatters import format_error_blocks, format_response_blocks
+from it_agent.bot.formatters import (
+    format_error_blocks,
+    format_response_blocks,
+    linkify_servicenow_refs,
+)
 from it_agent.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -225,8 +229,10 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
         _register_incident_channels(result)
 
-        blocks = format_response_blocks(result.text)
-        await say(text=result.text, blocks=blocks, thread_ts=thread_ts)
+        sn_url = settings.sn_instance_url
+        linked_text = linkify_servicenow_refs(result.text, sn_url)
+        blocks = format_response_blocks(result.text, sn_url)
+        await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
     except Exception:
         logger.exception("Error processing message")
@@ -290,8 +296,10 @@ async def _handle_incident_message(
 
         _register_incident_channels(result)
 
-        blocks = format_response_blocks(result.text)
-        await say(text=result.text, blocks=blocks)
+        sn_url = settings.sn_instance_url
+        linked_text = linkify_servicenow_refs(result.text, sn_url)
+        blocks = format_response_blocks(result.text, sn_url)
+        await say(text=linked_text, blocks=blocks)
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
@@ -332,6 +340,7 @@ async def _update_incident_summary(
 
     summary_bullets = "\n".join(f"• {line}" for line in ctx["summary_lines"])
     updated_text = f"{original}\n\n*LIVE SUMMARY:*\n{summary_bullets}"
+    updated_text = linkify_servicenow_refs(updated_text, settings.sn_instance_url)
 
     try:
         client = AsyncWebClient(token=settings.slack_bot_token)
@@ -368,8 +377,10 @@ async def _handle_help_channel_message(
 
         _register_incident_channels(result)
 
-        blocks = format_response_blocks(result.text)
-        await say(text=result.text, blocks=blocks, thread_ts=thread_ts)
+        sn_url = settings.sn_instance_url
+        linked_text = linkify_servicenow_refs(result.text, sn_url)
+        blocks = format_response_blocks(result.text, sn_url)
+        await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
         # Post threaded follow-ups for any tickets created during this run
         for tc in result.tool_calls:
@@ -398,6 +409,7 @@ async def _handle_help_channel_message(
                 f"to troubleshoot this issue. Updates will be posted here "
                 f"after resolution."
             )
+            followup = linkify_servicenow_refs(followup, sn_url)
             await say(text=followup, thread_ts=thread_ts)
 
     except Exception:
@@ -411,19 +423,49 @@ async def _handle_help_channel_message(
 async def post_resolution_update(
     ticket_id: str, ticket_data: dict, settings: Settings
 ) -> None:
-    """Post a resolution message to the original #help-it thread."""
+    """Post a resolution message to the original #help-it thread and rename the incident channel."""
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    # Post to the original #help-it thread
     thread_info = _ticket_threads.pop(ticket_id, None)
-    if thread_info is None:
+    if thread_info is not None:
+        channel, thread_ts = thread_info
+        status = ticket_data.get("status", "resolved")
+        title = ticket_data.get("title", ticket_id)
+        close_notes = ticket_data.get("close_notes", "")
+
+        message = f":white_check_mark: *Ticket {ticket_id} — {status}.* {title}"
+        if close_notes:
+            message += f"\n>_{close_notes}_"
+        message = linkify_servicenow_refs(message, settings.sn_instance_url)
+
+        await client.chat_postMessage(channel=channel, text=message, thread_ts=thread_ts)
+
+    # Rename the incident channel to append "-resolved"
+    await _rename_incident_channel_resolved(ticket_id, client)
+
+
+async def _rename_incident_channel_resolved(
+    ticket_id: str, client: AsyncWebClient
+) -> None:
+    """Find the incident channel for *ticket_id* and append '-resolved' to its name."""
+    # Reverse-lookup: find channel_id whose context has this ticket_id
+    channel_id: str | None = None
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            channel_id = ch_id
+            break
+
+    if channel_id is None:
         return
 
-    channel, thread_ts = thread_info
-    status = ticket_data.get("status", "resolved")
-    title = ticket_data.get("title", ticket_id)
-    close_notes = ticket_data.get("close_notes", "")
-
-    message = f":white_check_mark: *Ticket {ticket_id} — {status}.* {title}"
-    if close_notes:
-        message += f"\n>_{close_notes}_"
-
-    client = AsyncWebClient(token=settings.slack_bot_token)
-    await client.chat_postMessage(channel=channel, text=message, thread_ts=thread_ts)
+    try:
+        info = await client.conversations_info(channel=channel_id)
+        current_name = info["channel"]["name"]
+        if current_name.endswith("-resolved"):
+            return  # already renamed
+        new_name = f"{current_name}-resolved"[:80]
+        await client.conversations_rename(channel=channel_id, name=new_name)
+        logger.info("Renamed incident channel %s → %s", current_name, new_name)
+    except Exception:
+        logger.warning("Failed to rename incident channel %s", channel_id, exc_info=True)
