@@ -131,6 +131,25 @@ def _ticket_id_from_channel_name(channel_name: str) -> str | None:
     return None
 
 
+def _find_incident_channel_for_thread(channel: str, thread_ts: str) -> str | None:
+    """Reverse-lookup: find the incident channel associated with a #help-it thread.
+
+    Walks _ticket_threads to find the ticket_id for (channel, thread_ts),
+    then walks _incident_context to find the channel_id for that ticket.
+    """
+    ticket_id: str | None = None
+    for tid, (ch, ts) in _ticket_threads.items():
+        if ch == channel and ts == thread_ts:
+            ticket_id = tid
+            break
+    if ticket_id is None:
+        return None
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            return ch_id
+    return None
+
+
 async def discover_incident_channels(settings: Settings) -> None:
     """Scan private channels the bot belongs to and register incident channels.
 
@@ -553,6 +572,27 @@ async def _handle_help_channel_message(
         blocks = format_response_blocks(result.text, sn_url)
         await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
+        # Forward thread replies to the incident channel
+        if event.get("thread_ts"):
+            try:
+                inc_channel = _find_incident_channel_for_thread(channel, thread_ts)
+                if inc_channel:
+                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    # Resolve display name for attribution
+                    try:
+                        user_info = await slack.users_info(user=user_id)
+                        display_name = (
+                            user_info["user"]["profile"].get("display_name")
+                            or user_info["user"]["profile"].get("real_name")
+                            or user_id
+                        )
+                    except Exception:
+                        display_name = user_id
+                    fwd_text = f"*{display_name}* in #help-it thread:\n>{text}"
+                    await slack.chat_postMessage(channel=inc_channel, text=fwd_text)
+            except Exception:
+                logger.debug("Failed to forward thread reply to incident channel", exc_info=True)
+
         # Collect KB results from this run
         kb_results: list[dict] = []
         for tc in result.tool_calls:
@@ -589,6 +629,25 @@ async def _handle_help_channel_message(
             )
             followup = linkify_servicenow_refs(followup, sn_url)
             await say(text=followup, thread_ts=thread_ts)
+
+            # Post a permalink to the original #help-it thread in the incident channel
+            if channel_id:
+                try:
+                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    plink = await slack.chat_getPermalink(
+                        channel=channel, message_ts=thread_ts,
+                    )
+                    permalink = plink.get("permalink", "")
+                    if permalink:
+                        await slack.chat_postMessage(
+                            channel=channel_id,
+                            text=f":link: <{permalink}|Original #help-it thread>",
+                        )
+                except Exception:
+                    logger.debug(
+                        "Failed to post thread permalink in incident channel %s",
+                        channel_id, exc_info=True,
+                    )
 
             # Post KB article content in the incident channel
             if kb_results and channel_id:

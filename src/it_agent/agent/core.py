@@ -45,8 +45,10 @@ the knowledge base. Every interaction must be tracked. Create the ticket as your
 then continue troubleshooting.
 - Always include the ticket number and private channel name in your response.
 - When the user confirms the issue is resolved (e.g., "that worked", "all good", "this helped", \
-"that would be all"), **immediately resolve the ticket** using the update_ticket tool with \
-status "resolved" and a brief close_notes summary of what fixed it.
+"that would be all"), **do NOT immediately resolve the ticket**. First ask what fixed it \
+(e.g. "Could you briefly share what resolved the issue so I can add it to the ticket?"). \
+Once the user provides details, resolve with those as close_notes. If the user declines or \
+is unsure, resolve with a brief summary from conversation context.
 """
 
 # Build Gemini function declarations from our TOOLS list at module level.
