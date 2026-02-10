@@ -118,6 +118,18 @@ def _parse_incident_message(text: str) -> dict:
     return ctx
 
 
+def _ticket_id_from_channel_name(channel_name: str) -> str | None:
+    """Extract a ticket ID from an incident channel name.
+
+    Channel names follow the pattern ``inc0129540-username``.
+    Returns e.g. ``'INC0129540'`` or *None* if the name doesn't match.
+    """
+    m = re.match(r"^(inc\d+)", channel_name, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
 async def discover_incident_channels(settings: Settings) -> None:
     """Scan private channels the bot belongs to and register incident channels.
 
@@ -140,11 +152,16 @@ async def discover_incident_channels(settings: Settings) -> None:
             if not cursor:
                 break
 
-        # Fetch context from the first bot message in each channel
+        # Fetch context from the first bot message in each channel.
+        # Fall back to extracting the ticket ID from the channel name.
         for ch_id in channel_ids:
             try:
+                info = await client.conversations_info(channel=ch_id)
+                ch_name = info.get("channel", {}).get("name", "")
+
                 hist = await client.conversations_history(channel=ch_id, limit=50)
                 # Scan all messages for the incident summary (posted by the bot)
+                found = False
                 for msg in hist.get("messages", []):
                     if not msg.get("bot_id"):
                         continue
@@ -159,7 +176,26 @@ async def discover_incident_channels(settings: Settings) -> None:
                             "original_text": original,
                             "summary_lines": [],
                         }
+                        found = True
                         break
+
+                # Fallback: extract ticket ID from channel name
+                if not found:
+                    ticket_id = _ticket_id_from_channel_name(ch_name)
+                    if ticket_id:
+                        _incident_context[ch_id] = {
+                            "ticket_id": ticket_id,
+                            "title": "",
+                            "description": "",
+                            "priority": "",
+                            "summary_ts": None,
+                            "original_text": None,
+                            "summary_lines": [],
+                        }
+                        logger.info(
+                            "Seeded incident context for %s from channel name (%s)",
+                            ch_name, ticket_id,
+                        )
             except Exception:
                 logger.debug("Could not fetch history for channel %s", ch_id)
 
@@ -326,8 +362,54 @@ async def _handle_incident_message(
     conv_key = (channel, "incident")
     history = _conversations.setdefault(conv_key, [])
 
+    # Ensure we have incident context — fallback to channel name if needed
+    if channel not in _incident_context:
+        try:
+            slack_client = AsyncWebClient(token=settings.slack_bot_token)
+            info = await slack_client.conversations_info(channel=channel)
+            ch_name = info.get("channel", {}).get("name", "")
+            ticket_id = _ticket_id_from_channel_name(ch_name)
+            if ticket_id:
+                _incident_context[channel] = {
+                    "ticket_id": ticket_id,
+                    "title": "",
+                    "description": "",
+                    "priority": "",
+                    "summary_ts": None,
+                    "original_text": None,
+                    "summary_lines": [],
+                }
+                logger.info(
+                    "Seeded incident context on-the-fly for %s (%s)", ch_name, ticket_id,
+                )
+        except Exception:
+            logger.debug("Could not resolve channel name for %s", channel)
+
     # Seed context on first interaction so the agent knows what the channel is about
     if not history:
+        # Try to recover previous channel messages (e.g. after restart)
+        try:
+            slack_client = AsyncWebClient(token=settings.slack_bot_token)
+            auth = await slack_client.auth_test()
+            bot_uid = auth["user_id"]
+            resp = await slack_client.conversations_history(channel=channel, limit=MAX_HISTORY)
+            msgs = resp.get("messages", [])
+            msgs.reverse()  # oldest first
+            for msg in msgs:
+                if msg.get("subtype"):
+                    continue
+                msg_text = msg.get("text", "").strip()
+                if not msg_text:
+                    continue
+                if msg.get("user") == bot_uid or msg.get("bot_id"):
+                    history.append({"role": "assistant", "content": msg_text})
+                else:
+                    history.append({"role": "user", "content": msg_text})
+            if history:
+                logger.info("Recovered %d messages for incident channel %s", len(history), channel)
+        except Exception:
+            logger.debug("Could not recover history for incident channel %s", channel)
+
         ctx = _incident_context.get(channel, {})
         if ctx:
             context_msg = (
@@ -341,8 +423,9 @@ async def _handle_incident_message(
                 f"When the user asks you to do something, always assume it relates "
                 f"to this issue — do not ask for clarification about the topic."
             )
-            history.append({"role": "user", "content": context_msg})
-            history.append({
+            # Insert context at the beginning, before any recovered messages
+            history.insert(0, {"role": "user", "content": context_msg})
+            history.insert(1, {
                 "role": "assistant",
                 "content": (
                     f"Understood. I'm tracking incident {ctx.get('ticket_id', 'this issue')}: "
