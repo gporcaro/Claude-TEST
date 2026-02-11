@@ -42,8 +42,12 @@ async def search_kb(
         hits = response.points
 
         # 3. Deduplicate by article_id, keep best score per article
+        #    Discard results below the relevance threshold.
+        _MIN_SCORE = 0.60
         seen: dict[str, dict] = {}
         for hit in hits:
+            if hit.score < _MIN_SCORE:
+                continue
             article_id = hit.payload.get("article_id", "")
             if article_id not in seen or hit.score > seen[article_id]["score"]:
                 seen[article_id] = {
