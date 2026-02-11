@@ -18,6 +18,7 @@ from it_agent.bot.formatters import (
     linkify_servicenow_refs,
 )
 from it_agent.config import Settings
+from it_agent import db
 from it_agent.servicenow.client import ServiceNowClient
 from it_agent.tools.users import resolve_sn_user_to_slack
 
@@ -43,6 +44,9 @@ _incident_context: dict[str, dict] = {}
 # Resolved tickets pending auto-close: ticket_id → resolved_epoch
 _resolved_pending_close: dict[str, float] = {}
 
+# Interaction tracking: (channel, thread_ts) → interaction_id in the DB
+_interaction_ids: dict[tuple[str, str], int] = {}
+
 # 48 hours in seconds
 _AUTO_CLOSE_DELAY = 48 * 60 * 60
 
@@ -55,6 +59,46 @@ def _get_agent(settings: Settings) -> Agent:
     if _agent is None:
         _agent = Agent(settings)
     return _agent
+
+
+async def _resolve_user_name(user_id: str, settings: Settings) -> str:
+    """Best-effort resolve Slack user_id to display name."""
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        info = await client.users_info(user=user_id)
+        profile = info["user"]["profile"]
+        return profile.get("display_name") or profile.get("real_name") or user_id
+    except Exception:
+        return user_id
+
+
+async def _record_agent_result(
+    interaction_id: int, user_text: str, result: AgentResult,
+) -> None:
+    """Record messages and tool calls from an agent run into the database."""
+    try:
+        await db.add_message(interaction_id, "user", user_text)
+        for tc in result.tool_calls:
+            summary = ""
+            r = tc.get("result")
+            if isinstance(r, dict):
+                if r.get("success") is not None:
+                    summary = "success" if r["success"] else "failed"
+                elif r.get("error"):
+                    summary = f"error: {str(r['error'])[:100]}"
+            elif isinstance(r, str):
+                summary = r[:200]
+            await db.add_tool_call(
+                interaction_id, tc["name"], tc.get("args"), summary,
+            )
+        await db.add_message(interaction_id, "assistant", result.text)
+        await db.increment_counts(
+            interaction_id,
+            messages=2,  # user + assistant
+            tool_calls=len(result.tool_calls),
+        )
+    except Exception:
+        logger.debug("Failed to record agent result for interaction %d", interaction_id, exc_info=True)
 
 
 async def _recover_thread_history(
@@ -398,8 +442,6 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     if conv_key not in _conversations:
         recovered = await _recover_thread_history(channel, thread_ts, settings)
         if recovered:
-            # The last message in recovered history is the current message,
-            # so we use the recovered history directly
             _conversations[conv_key] = recovered
             history = _conversations[conv_key]
         else:
@@ -408,6 +450,18 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     else:
         history = _conversations[conv_key]
         history.append({"role": "user", "content": text})
+
+    # Create interaction record on first message in this conversation
+    if conv_key not in _interaction_ids:
+        try:
+            requester_name = await _resolve_user_name(user_id, settings)
+            iid = await db.create_interaction(
+                channel_id=channel, thread_ts=thread_ts, source="dm",
+                requester_slack_id=user_id, requester_name=requester_name,
+            )
+            _interaction_ids[conv_key] = iid
+        except Exception:
+            logger.debug("Failed to create DM interaction record", exc_info=True)
 
     # Trim old history
     if len(history) > MAX_HISTORY:
@@ -422,6 +476,11 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         history.append({"role": "assistant", "content": result.text})
 
         await _register_incident_channels(result)
+
+        # Record interaction data
+        iid = _interaction_ids.get(conv_key)
+        if iid is not None:
+            await _record_agent_result(iid, text, result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
@@ -531,6 +590,26 @@ async def _handle_incident_message(
 
     history.append({"role": "user", "content": text})
 
+    # Look up or create interaction for this incident channel
+    if conv_key not in _interaction_ids:
+        ctx = _incident_context.get(channel, {})
+        ticket_id = ctx.get("ticket_id")
+        if ticket_id:
+            try:
+                existing = await db.get_interaction_by_ticket(ticket_id)
+                if existing:
+                    _interaction_ids[conv_key] = existing["id"]
+                else:
+                    requester_name = await _resolve_user_name(user_id, settings)
+                    iid = await db.create_interaction(
+                        channel_id=channel, source="incident",
+                        requester_slack_id=user_id, requester_name=requester_name,
+                        ticket_id=ticket_id, priority=ctx.get("priority", "medium"),
+                    )
+                    _interaction_ids[conv_key] = iid
+            except Exception:
+                logger.debug("Failed to look up/create incident interaction", exc_info=True)
+
     if len(history) > MAX_HISTORY:
         _conversations[conv_key] = history[-MAX_HISTORY:]
         history = _conversations[conv_key]
@@ -542,6 +621,11 @@ async def _handle_incident_message(
         history.append({"role": "assistant", "content": result.text})
 
         await _register_incident_channels(result)
+
+        # Record interaction data
+        iid = _interaction_ids.get(conv_key)
+        if iid is not None:
+            await _record_agent_result(iid, text, result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
@@ -635,6 +719,18 @@ async def _handle_help_channel_message(
         history = _conversations[conv_key]
         history.append({"role": "user", "content": text})
 
+    # Create interaction record on first message in this thread
+    if conv_key not in _interaction_ids:
+        try:
+            requester_name = await _resolve_user_name(user_id, settings)
+            iid = await db.create_interaction(
+                channel_id=channel, thread_ts=thread_ts, source="help-it",
+                requester_slack_id=user_id, requester_name=requester_name,
+            )
+            _interaction_ids[conv_key] = iid
+        except Exception:
+            logger.debug("Failed to create help-it interaction record", exc_info=True)
+
     if len(history) > MAX_HISTORY:
         _conversations[conv_key] = history[-MAX_HISTORY:]
         history = _conversations[conv_key]
@@ -646,6 +742,11 @@ async def _handle_help_channel_message(
         history.append({"role": "assistant", "content": result.text})
 
         await _register_incident_channels(result)
+
+        # Record interaction data
+        iid = _interaction_ids.get(conv_key)
+        if iid is not None:
+            await _record_agent_result(iid, text, result)
 
         sn_url = settings.sn_instance_url
         linked_text = linkify_servicenow_refs(result.text, sn_url)
@@ -710,6 +811,19 @@ async def _handle_help_channel_message(
                 continue
 
             _ticket_threads[ticket_id] = (channel, thread_ts)
+
+            # Update interaction with ticket info and SN categorization
+            if iid is not None:
+                try:
+                    await db.update_interaction(
+                        iid,
+                        ticket_id=ticket_id,
+                        category=ticket.get("category", ""),
+                        subcategory=ticket.get("subcategory", ""),
+                        priority=ticket.get("priority", "medium"),
+                    )
+                except Exception:
+                    logger.debug("Failed to update interaction with ticket info", exc_info=True)
 
             followup = (
                 f":ticket: *Ticket {ticket_id} created.* "
@@ -818,6 +932,21 @@ async def post_resolution_update(
         "close_notes": ticket_data.get("close_notes", "")[:200],
     })
 
+    # Update interaction record: resolved
+    try:
+        interaction = await db.get_interaction_by_ticket(ticket_id)
+        if interaction:
+            resolved_by_bot = 1 if not interaction.get("assignee_slack_id") else 0
+            await db.update_interaction(
+                interaction["id"],
+                status="resolved",
+                resolved_at=db._now_iso(),
+                close_notes=ticket_data.get("close_notes", ""),
+                resolved_by_bot=resolved_by_bot,
+            )
+    except Exception:
+        logger.debug("Failed to update interaction on resolution for %s", ticket_id, exc_info=True)
+
     # Rename the incident channel to append "-resolved"
     await _rename_incident_channel_resolved(ticket_id, client)
 
@@ -857,6 +986,19 @@ async def _handle_ticket_assigned(
     await emit("ticket_assigned", {
         "ticket_id": ticket_id, "assignee_name": real_name, "channel_id": channel_id,
     })
+
+    # Update interaction record with assignee info
+    try:
+        interaction = await db.get_interaction_by_ticket(ticket_id)
+        if interaction:
+            await db.update_interaction(
+                interaction["id"],
+                assignee_slack_id=slack_id,
+                assignee_name=real_name,
+                status="in_progress",
+            )
+    except Exception:
+        logger.debug("Failed to update interaction assignee for %s", ticket_id, exc_info=True)
 
     # Invite the assignee to the channel
     try:
@@ -1004,6 +1146,14 @@ async def _auto_close_ticket(
 
     await emit("ticket_auto_closed", {"ticket_id": ticket_id, "channel_id": channel_id})
     await emit("channel_archived", {"ticket_id": ticket_id, "channel_id": channel_id})
+
+    # Update interaction record: closed
+    try:
+        interaction = await db.get_interaction_by_ticket(ticket_id)
+        if interaction:
+            await db.update_interaction(interaction["id"], status="closed")
+    except Exception:
+        logger.debug("Failed to update interaction on auto-close for %s", ticket_id, exc_info=True)
 
     # Clean up tracking
     _incident_channels.discard(channel_id)

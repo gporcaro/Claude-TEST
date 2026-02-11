@@ -8,6 +8,7 @@ from it_agent.bot.app import create_app, start_app
 from it_agent.bot import events
 from it_agent.bot.handlers import discover_incident_channels, start_auto_close_loop
 from it_agent.config import get_settings
+from it_agent.db import init_db
 from it_agent.kb.indexer import index_knowledge_base
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ def main() -> None:
 
 async def _start(settings) -> None:
     events.configure(settings.dashboard_url)
+    await init_db(settings.db_path)
 
     await _ensure_kb_indexed(settings)
     await discover_incident_channels(settings)

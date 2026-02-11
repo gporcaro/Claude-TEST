@@ -46,6 +46,8 @@ def _normalize_incident(record: dict) -> dict:
         "priority": _URGENCY_TO_PRIORITY.get(str(record.get("urgency", "3")), "medium"),
         "status": _STATE_TO_STATUS.get(str(record.get("state", "1")), "open"),
         "category": record.get("category", ""),
+        "subcategory": record.get("subcategory", ""),
+        "contact_type": record.get("contact_type", ""),
         "requester_id": record.get("caller_id", ""),
         "assignee_id": record.get("assigned_to", ""),
         "created_at": record.get("sys_created_on", ""),

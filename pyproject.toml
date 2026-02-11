@@ -15,6 +15,7 @@ dependencies = [
     "pydantic-settings>=2.5.0",
     "aiofiles>=24.1.0",
     "qdrant-client>=1.7.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.optional-dependencies]

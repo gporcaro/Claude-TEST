@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # Dashboard
     dashboard_url: str = "http://localhost:8050"
 
+    # Database
+    db_path: str = "interactions.db"
+
     # Misc
     log_level: str = "INFO"
     max_tool_loops: int = 10
