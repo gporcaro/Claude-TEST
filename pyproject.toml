@@ -16,6 +16,8 @@ dependencies = [
     "aiofiles>=24.1.0",
     "qdrant-client>=1.7.0",
     "aiosqlite>=0.20.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,7 @@ dev = [
 [project.scripts]
 it-agent = "it_agent.main:main"
 it-agent-index = "it_agent.cli.index:main"
+it-agent-index-public = "it_agent.cli.index_public:main"
 
 [tool.ruff]
 target-version = "py39"

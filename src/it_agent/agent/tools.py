@@ -217,6 +217,31 @@ TOOLS = [
             "required": ["query"],
         },
     },
+    # --- Public Articles ---
+    {
+        "name": "search_public_articles",
+        "description": (
+            "Search for articles from official vendor sources (Apple, Microsoft, Dell) "
+            "about hardware, software, and OS topics. Use this when the internal knowledge "
+            "base doesn't have relevant results for device-specific issues, OS configuration, "
+            "or hardware troubleshooting."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query",
+                },
+                "n_results": {
+                    "type": "integer",
+                    "description": "Number of results (default 3, max 5)",
+                    "default": 3,
+                },
+            },
+            "required": ["query"],
+        },
+    },
     # --- User Lookup ---
     {
         "name": "lookup_user",

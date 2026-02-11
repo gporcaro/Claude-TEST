@@ -13,7 +13,9 @@ from it_agent.agent import executor
 from it_agent.agent.core import Agent, AgentResult
 from it_agent.bot.events import emit
 from it_agent.bot.formatters import (
+    format_approval_blocks,
     format_error_blocks,
+    format_public_article_blocks,
     format_response_blocks,
     linkify_servicenow_refs,
 )
@@ -387,6 +389,129 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
     executor._on_ticket_assigned = _assignment_callback
 
+    # --- Public article feedback actions ---
+
+    @app.action("article_helpful")
+    async def handle_article_helpful(ack, body) -> None:
+        await ack()
+        article_id = body["actions"][0]["value"]
+        user_id = body["user"]["id"]
+        updated = await db.record_feedback(int(article_id), user_id, "helpful")
+        if updated:
+            # Check if article reached trust threshold
+            if (
+                updated["status"] not in ("trusted",)
+                and updated["confidence_score"] >= settings.public_trust_threshold
+            ):
+                await db.update_public_article(int(article_id), status="trusted")
+                logger.info("Article %s promoted to trusted (score %d)", article_id, updated["confidence_score"])
+            # Update the message to acknowledge the vote
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                pos = updated["positive_votes"]
+                neg = updated["negative_votes"]
+                await client.chat_update(
+                    channel=body["channel"]["id"],
+                    ts=body["message"]["ts"],
+                    text=f"Thanks for your feedback! (Helpful: {pos} | Not helpful: {neg})",
+                    blocks=body["message"].get("blocks", []),
+                )
+            except Exception:
+                logger.debug("Failed to update feedback message", exc_info=True)
+
+    @app.action("article_not_helpful")
+    async def handle_article_not_helpful(ack, body) -> None:
+        await ack()
+        article_id = body["actions"][0]["value"]
+        user_id = body["user"]["id"]
+        updated = await db.record_feedback(int(article_id), user_id, "not_helpful")
+        if updated:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                pos = updated["positive_votes"]
+                neg = updated["negative_votes"]
+                await client.chat_update(
+                    channel=body["channel"]["id"],
+                    ts=body["message"]["ts"],
+                    text=f"Thanks for your feedback! (Helpful: {pos} | Not helpful: {neg})",
+                    blocks=body["message"].get("blocks", []),
+                )
+            except Exception:
+                logger.debug("Failed to update feedback message", exc_info=True)
+
+    # --- Article approval actions ---
+
+    @app.action("approve_article")
+    async def handle_approve_article(ack, body) -> None:
+        await ack()
+        article_id = int(body["actions"][0]["value"])
+        approver_id = body["user"]["id"]
+        approver_name = await _resolve_user_name(approver_id, settings)
+
+        await db.update_public_article(article_id, status="approved")
+
+        # Index article into Qdrant
+        try:
+            from google import genai
+            from it_agent.kb.public_indexer import index_single_article
+            genai_client = genai.Client(api_key=settings.gemini_api_key)
+            await index_single_article(article_id, settings, genai_client)
+        except Exception:
+            logger.warning("Failed to index approved article %d", article_id, exc_info=True)
+
+        # Update the approval message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            article = await db.get_public_article(article_id)
+            title = article["title"] if article else f"Article {article_id}"
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=body["message"]["ts"],
+                text=f":white_check_mark: *{title}* — Approved by {approver_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":white_check_mark: *{title}* — Approved by {approver_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update approval message", exc_info=True)
+
+        await emit("article_approved", {"article_id": article_id, "approver": approver_name})
+
+    @app.action("deny_article")
+    async def handle_deny_article(ack, body) -> None:
+        await ack()
+        article_id = int(body["actions"][0]["value"])
+        denier_id = body["user"]["id"]
+        denier_name = await _resolve_user_name(denier_id, settings)
+
+        await db.update_public_article(article_id, status="denied")
+
+        # Update the approval message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            article = await db.get_public_article(article_id)
+            title = article["title"] if article else f"Article {article_id}"
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=body["message"]["ts"],
+                text=f":no_entry: *{title}* — Denied by {denier_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":no_entry: *{title}* — Denied by {denier_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update denial message", exc_info=True)
+
+        await emit("article_denied", {"article_id": article_id, "denier": denier_name})
+
 
 async def _register_incident_channels(result: AgentResult) -> None:
     """Track any incident channels created during this agent run."""
@@ -486,6 +611,9 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         linked_text = linkify_servicenow_refs(result.text, sn_url)
         blocks = format_response_blocks(result.text, sn_url)
         await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+
+        # Post public article feedback buttons + approval requests
+        await _post_public_article_followups(result, channel, thread_ts, settings)
 
     except Exception as exc:
         logger.exception("Error processing message")
@@ -634,6 +762,9 @@ async def _handle_incident_message(
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
+
+        # Post public article feedback buttons + approval requests
+        await _post_public_article_followups(result, channel, None, settings)
 
     except Exception as exc:
         logger.exception("Error processing incident channel message")
@@ -859,6 +990,9 @@ async def _handle_help_channel_message(
                     channel_id, kb_results, settings,
                 )
 
+        # Post public article feedback buttons + approval requests
+        await _post_public_article_followups(result, channel, thread_ts, settings)
+
     except Exception as exc:
         logger.exception("Error processing #help-it message")
         await emit("error", {"source": "help-it", "message": str(exc)[:300]})
@@ -866,6 +1000,65 @@ async def _handle_help_channel_message(
             "Something went wrong processing your request. Please try again."
         )
         await say(text="Error processing request", blocks=blocks, thread_ts=thread_ts)
+
+
+async def _post_public_article_followups(
+    result: AgentResult,
+    channel: str,
+    thread_ts: str | None,
+    settings: Settings,
+) -> None:
+    """After the agent responds, check for public article results and post feedback buttons + approvals."""
+    for tc in result.tool_calls:
+        if tc["name"] != "search_public_articles":
+            continue
+        r = tc.get("result", {})
+
+        # Post feedback buttons for returned articles
+        articles = r.get("results", [])
+        if articles:
+            blocks = format_public_article_blocks(articles)
+            if blocks:
+                try:
+                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    kwargs: dict = {"channel": channel, "text": "Public articles", "blocks": blocks}
+                    if thread_ts:
+                        kwargs["thread_ts"] = thread_ts
+                    await client.chat_postMessage(**kwargs)
+                except Exception:
+                    logger.debug("Failed to post public article blocks", exc_info=True)
+
+        # Post approval requests for pending articles
+        pending = r.get("needs_approval", [])
+        if pending and settings.it_helpdesk_channel_id:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            for item in pending:
+                article = await db.get_public_article(item["article_id"])
+                if not article:
+                    continue
+                blocks = format_approval_blocks(article)
+                try:
+                    resp = await client.chat_postMessage(
+                        channel=settings.it_helpdesk_channel_id,
+                        text=f"Article approval needed: {article['title']}",
+                        blocks=blocks,
+                    )
+                    # Store the approval message TS for timeout tracking
+                    await db.update_public_article(
+                        article["id"],
+                        approval_message_ts=resp["ts"],
+                        approval_channel=settings.it_helpdesk_channel_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to post approval request for article %d", article["id"],
+                        exc_info=True,
+                    )
+
+        await emit("public_article_search", {
+            "result_count": len(articles),
+            "pending_count": len(pending),
+        })
 
 
 async def _post_kb_results_to_channel(
@@ -1158,3 +1351,61 @@ async def _auto_close_ticket(
     # Clean up tracking
     _incident_channels.discard(channel_id)
     _incident_context.pop(channel_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Approval timeout loop
+# ---------------------------------------------------------------------------
+
+_APPROVAL_TIMEOUT_MINUTES = 30
+_APPROVAL_CHECK_INTERVAL = 5 * 60  # 5 minutes
+
+
+async def start_approval_timeout_loop(settings: Settings) -> None:
+    """Background loop that auto-denies article approvals older than 30 minutes."""
+    while True:
+        await asyncio.sleep(_APPROVAL_CHECK_INTERVAL)
+        try:
+            await _process_expired_approvals(settings)
+        except Exception:
+            logger.warning("Approval timeout loop iteration failed", exc_info=True)
+
+
+async def _process_expired_approvals(settings: Settings) -> None:
+    """Auto-deny articles whose approval request is older than the timeout."""
+    expired = await db.get_pending_approvals(older_than_minutes=_APPROVAL_TIMEOUT_MINUTES)
+    if not expired:
+        return
+
+    logger.info("Auto-denying %d expired article approval(s)", len(expired))
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    for article in expired:
+        article_id = article["id"]
+        await db.update_public_article(article_id, status="denied")
+
+        # Update the Slack approval message if we have the TS
+        msg_ts = article.get("approval_message_ts")
+        ch = article.get("approval_channel")
+        if msg_ts and ch:
+            try:
+                title = article.get("title", f"Article {article_id}")
+                await client.chat_update(
+                    channel=ch,
+                    ts=msg_ts,
+                    text=f":hourglass: *{title}* — Auto-denied (timed out after {_APPROVAL_TIMEOUT_MINUTES}min)",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f":hourglass: *{title}* — Auto-denied "
+                                f"(timed out after {_APPROVAL_TIMEOUT_MINUTES}min)"
+                            ),
+                        },
+                    }],
+                )
+            except Exception:
+                logger.debug("Failed to update expired approval message for article %d", article_id, exc_info=True)
+
+        await emit("article_auto_denied", {"article_id": article_id})

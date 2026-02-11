@@ -9,6 +9,7 @@ from collections.abc import Callable
 from it_agent.config import Settings
 from it_agent.tools.diagnostics import check_disk_usage, check_service_status, dns_lookup, ping_host
 from it_agent.tools.knowledge import search_knowledge_base
+from it_agent.tools.public_knowledge import search_public_articles
 from it_agent.tools.tickets import create_ticket, get_ticket, list_tickets, update_ticket
 from it_agent.tools.users import lookup_user
 
@@ -25,6 +26,7 @@ _TOOL_HANDLERS = {
     "update_ticket": update_ticket,
     "list_tickets": list_tickets,
     "search_knowledge_base": search_knowledge_base,
+    "search_public_articles": search_public_articles,
     "lookup_user": lookup_user,
 }
 
@@ -55,6 +57,9 @@ async def execute_tool(
             args["_user_id"] = user_id
         elif tool_name in ("get_ticket", "list_tickets"):
             args["_settings"] = settings
+        elif tool_name == "search_public_articles":
+            args["_settings"] = settings
+            args["_user_id"] = user_id
         elif tool_name in ("search_knowledge_base", "lookup_user"):
             args["_settings"] = settings
 

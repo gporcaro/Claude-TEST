@@ -25,6 +25,17 @@ class Settings(BaseSettings):
     # Qdrant vector database
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "it_kb"
+    qdrant_public_collection: str = "it_kb_public"
+
+    # Google Custom Search Engine (for public article fallback)
+    google_cse_api_key: str = ""
+    google_cse_cx: str = ""
+
+    # IT helpdesk channel for article approvals
+    it_helpdesk_channel_id: str = ""
+
+    # Public KB
+    public_trust_threshold: int = 5
 
     # SMTP (used by dashboard for MFA)
     smtp_email: str = ""

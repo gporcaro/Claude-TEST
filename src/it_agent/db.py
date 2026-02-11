@@ -75,6 +75,37 @@ CREATE TABLE IF NOT EXISTS interaction_tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_interaction ON interaction_tool_calls(interaction_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON interaction_tool_calls(tool_name);
+
+CREATE TABLE IF NOT EXISTS public_articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    snippet TEXT NOT NULL DEFAULT '',
+    source_domain TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    positive_votes INTEGER NOT NULL DEFAULT 0,
+    negative_votes INTEGER NOT NULL DEFAULT 0,
+    confidence_score INTEGER NOT NULL DEFAULT 0,
+    qdrant_indexed INTEGER NOT NULL DEFAULT 0,
+    approval_message_ts TEXT,
+    approval_channel TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pub_articles_url ON public_articles(url);
+CREATE INDEX IF NOT EXISTS idx_pub_articles_status ON public_articles(status);
+
+CREATE TABLE IF NOT EXISTS article_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id INTEGER NOT NULL,
+    user_slack_id TEXT NOT NULL,
+    vote TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (article_id) REFERENCES public_articles(id),
+    UNIQUE(article_id, user_slack_id)
+);
 """
 
 
@@ -220,3 +251,118 @@ async def get_interaction_by_ticket(ticket_id: str) -> Optional[dict]:
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Public articles
+# ---------------------------------------------------------------------------
+
+async def create_public_article(
+    *,
+    url: str,
+    title: str,
+    content: str = "",
+    snippet: str = "",
+    source_domain: str,
+    status: str = "pending",
+) -> int:
+    """Insert a public article record. Returns the article id."""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    now = _now_iso()
+    cursor = await _db.execute(
+        """INSERT INTO public_articles
+           (url, title, content, snippet, source_domain, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (url, title, content, snippet, source_domain, status, now, now),
+    )
+    await _db.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_public_article(article_id: int) -> Optional[dict]:
+    """Fetch a single public article by id."""
+    if _db is None:
+        return None
+    cursor = await _db.execute("SELECT * FROM public_articles WHERE id = ?", (article_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_public_article_by_url(url: str) -> Optional[dict]:
+    """Fetch a public article by its URL."""
+    if _db is None:
+        return None
+    cursor = await _db.execute("SELECT * FROM public_articles WHERE url = ?", (url,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def update_public_article(article_id: int, **fields: Any) -> None:
+    """Update arbitrary fields on a public article record."""
+    if _db is None or not fields:
+        return
+    fields["updated_at"] = _now_iso()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [article_id]
+    await _db.execute(
+        f"UPDATE public_articles SET {set_clause} WHERE id = ?",  # noqa: S608
+        values,
+    )
+    await _db.commit()
+
+
+async def record_feedback(
+    article_id: int, user_slack_id: str, vote: str,
+) -> Optional[dict]:
+    """Upsert a feedback vote for an article, recalculate scores, return updated article.
+
+    *vote* should be ``"helpful"`` or ``"not_helpful"``.
+    """
+    if _db is None:
+        return None
+    now = _now_iso()
+    # Upsert the vote (one vote per user per article)
+    await _db.execute(
+        """INSERT INTO article_feedback (article_id, user_slack_id, vote, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(article_id, user_slack_id) DO UPDATE SET vote = ?, created_at = ?""",
+        (article_id, user_slack_id, vote, now, vote, now),
+    )
+    # Recalculate scores from all votes
+    cursor = await _db.execute(
+        "SELECT vote, COUNT(*) as cnt FROM article_feedback WHERE article_id = ? GROUP BY vote",
+        (article_id,),
+    )
+    rows = await cursor.fetchall()
+    positive = 0
+    negative = 0
+    for row in rows:
+        if row["vote"] == "helpful":
+            positive = row["cnt"]
+        else:
+            negative = row["cnt"]
+    confidence = positive - negative
+    await _db.execute(
+        """UPDATE public_articles
+           SET positive_votes = ?, negative_votes = ?, confidence_score = ?, updated_at = ?
+           WHERE id = ?""",
+        (positive, negative, confidence, now, article_id),
+    )
+    await _db.commit()
+    return await get_public_article(article_id)
+
+
+async def get_pending_approvals(older_than_minutes: int = 30) -> list[dict]:
+    """Return pending articles whose approval request is older than *older_than_minutes*."""
+    if _db is None:
+        return []
+    cursor = await _db.execute(
+        """SELECT * FROM public_articles
+           WHERE status = 'pending'
+             AND approval_message_ts IS NOT NULL
+             AND created_at <= datetime('now', ?)""",
+        (f"-{older_than_minutes} minutes",),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]

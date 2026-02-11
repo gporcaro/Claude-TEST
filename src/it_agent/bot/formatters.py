@@ -89,6 +89,91 @@ def format_ticket_blocks(ticket: dict) -> list[dict]:
     ]
 
 
+def format_public_article_blocks(articles: list[dict]) -> list[dict]:
+    """Build Slack blocks for public articles with feedback buttons."""
+    blocks: list[dict] = []
+    for article in articles:
+        blocks.append({"type": "divider"})
+
+        confidence = article.get("confidence_score", 0)
+        status = article.get("status", "pending")
+        status_label = {
+            "trusted": "Trusted",
+            "approved": "Approved",
+            "curated": "Curated",
+        }.get(status, "New")
+        confidence_str = f"+{confidence}" if confidence > 0 else str(confidence)
+
+        text = (
+            f":globe_with_meridians: *{article['title']}*\n"
+            f"{article.get('snippet', '')}\n"
+            f"Source: {article.get('source_domain', '')} | "
+            f"{status_label} ({confidence_str})\n"
+            f"<{article['url']}>"
+        )
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+        })
+
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Helpful"},
+                    "action_id": "article_helpful",
+                    "value": str(article["id"]),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Not helpful"},
+                    "action_id": "article_not_helpful",
+                    "value": str(article["id"]),
+                    "style": "danger",
+                },
+            ],
+        })
+    return blocks
+
+
+def format_approval_blocks(article: dict) -> list[dict]:
+    """Build Slack blocks for an IT approval request."""
+    text = (
+        f":new: *New public article needs approval*\n\n"
+        f"*Title:* {article.get('title', 'Untitled')}\n"
+        f"*URL:* <{article['url']}>\n"
+        f"*Source:* {article.get('source_domain', 'unknown')}\n\n"
+        f"This article was found via web search. Approve to index it "
+        f"for future use, or deny to block it."
+    )
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "action_id": "approve_article",
+                    "value": str(article["id"]),
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Deny"},
+                    "action_id": "deny_article",
+                    "value": str(article["id"]),
+                    "style": "danger",
+                },
+            ],
+        },
+    ]
+
+
 def _chunk_text(text: str, max_len: int) -> list[str]:
     """Split text into chunks respecting word boundaries."""
     if len(text) <= max_len:
