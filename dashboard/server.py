@@ -9,10 +9,13 @@ import secrets
 import smtplib
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
+import aiosqlite
 from fastapi import Cookie, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
@@ -32,16 +35,40 @@ class DashboardSettings(BaseSettings):
     mfa_code_expiry_seconds: int = 300          # 5 min
     mfa_rate_limit_max: int = 3                 # 3 codes per window
     mfa_rate_limit_window_seconds: int = 600    # 10 min
+    db_path: str = str(Path(__file__).parent.parent / "interactions.db")
 
 
 settings = DashboardSettings()
 AUTHORIZED: set[str] = {e.strip().lower() for e in settings.authorized_emails.split(",") if e.strip()}
 
 # ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+_db: Optional[aiosqlite.Connection] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _db
+    _db = await aiosqlite.connect(settings.db_path)
+    _db.row_factory = aiosqlite.Row
+    # WAL must be set before query_only since changing journal mode is a write
+    try:
+        await _db.execute("PRAGMA journal_mode = WAL")
+    except Exception:
+        pass  # May fail if another process holds an exclusive lock
+    await _db.execute("PRAGMA query_only = ON")
+    yield
+    if _db:
+        await _db.close()
+        _db = None
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="IT Bot Dashboard")
+app = FastAPI(title="IT Bot Dashboard", lifespan=lifespan)
 
 # In-memory ring buffer of the last 200 events
 _events: deque[dict] = deque(maxlen=200)
@@ -73,6 +100,38 @@ class PendingCode:
 _sessions: dict[str, SessionData] = {}          # token → session
 _pending_codes: dict[str, PendingCode] = {}     # email → pending code
 _code_request_log: dict[str, list[float]] = {}  # email → timestamps
+
+_SESSIONS_FILE = Path(__file__).parent / ".sessions.json"
+
+
+def _load_sessions() -> None:
+    """Load persisted sessions from disk, discarding expired ones."""
+    if not _SESSIONS_FILE.exists():
+        return
+    try:
+        data = json.loads(_SESSIONS_FILE.read_text())
+        now = time.time()
+        for token, s in data.items():
+            if s["expires_at"] > now:
+                _sessions[token] = SessionData(
+                    email=s["email"],
+                    created_at=s["created_at"],
+                    expires_at=s["expires_at"],
+                )
+    except Exception:
+        pass  # Corrupt file — start fresh
+
+
+def _save_sessions() -> None:
+    """Persist current sessions to disk."""
+    data = {
+        token: {"email": s.email, "created_at": s.created_at, "expires_at": s.expires_at}
+        for token, s in _sessions.items()
+    }
+    _SESSIONS_FILE.write_text(json.dumps(data))
+
+
+_load_sessions()
 
 # ---------------------------------------------------------------------------
 # SMTP helper
@@ -113,6 +172,7 @@ def _valid_session(token: Optional[str]) -> Optional[SessionData]:
         return None
     if time.time() > session.expires_at:
         _sessions.pop(token, None)
+        _save_sessions()
         return None
     return session
 
@@ -220,6 +280,7 @@ async def verify_code(body: CodeVerify) -> JSONResponse:
         created_at=now,
         expires_at=now + settings.session_lifetime_hours * 3600,
     )
+    _save_sessions()
 
     response = JSONResponse({"ok": True})
     response.set_cookie(
@@ -238,6 +299,7 @@ async def logout(session_token: Optional[str] = Cookie(default=None)) -> JSONRes
     """Clear session and delete cookie."""
     if session_token:
         _sessions.pop(session_token, None)
+        _save_sessions()
     response = JSONResponse({"ok": True})
     response.delete_cookie(key="session_token", path="/")
     return response
@@ -306,6 +368,279 @@ async def static_file(path: str, _session: SessionData = Depends(require_auth)) 
     if not resolved.is_file():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return FileResponse(resolved)
+
+# ---------------------------------------------------------------------------
+# Live dashboard init (seed from DB on page load)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/live/init")
+async def live_init(_session: SessionData = Depends(require_auth)) -> JSONResponse:
+    """Return active tickets, stats, and recent tool calls from DB to seed the live dashboard."""
+    today_cutoff = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    # Active (non-resolved/closed) tickets
+    async with _db.execute(
+        """SELECT i.id, i.ticket_id, i.channel_id, i.priority, i.status,
+                  i.requester_name, i.category,
+                  (SELECT m.content FROM interaction_messages m
+                   WHERE m.interaction_id = i.id AND m.role = 'user'
+                   ORDER BY m.id LIMIT 1) AS first_message
+           FROM interactions i
+           WHERE i.status NOT IN ('resolved', 'closed')
+           ORDER BY i.created_at DESC"""
+    ) as cur:
+        tickets = [dict(r) for r in await cur.fetchall()]
+
+    # Today's resolved count
+    async with _db.execute(
+        "SELECT COUNT(*) FROM interactions WHERE status = 'resolved' AND resolved_at >= ?",
+        [today_cutoff],
+    ) as cur:
+        resolved_today = (await cur.fetchone())[0]
+
+    # Total interactions
+    async with _db.execute("SELECT COUNT(*) FROM interactions") as cur:
+        total_interactions = (await cur.fetchone())[0]
+
+    # Recent tool calls (last 10)
+    async with _db.execute(
+        """SELECT tool_name, args, result_summary, timestamp
+           FROM interaction_tool_calls
+           ORDER BY id DESC LIMIT 10"""
+    ) as cur:
+        tool_calls = [dict(r) for r in await cur.fetchall()]
+
+    # Messages in the last hour (for msgs/hr stat)
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    async with _db.execute(
+        "SELECT COUNT(*) FROM interaction_messages WHERE role = 'user' AND timestamp >= ?",
+        [one_hour_ago],
+    ) as cur:
+        msgs_last_hour = (await cur.fetchone())[0]
+
+    return JSONResponse({
+        "tickets": tickets,
+        "resolved_today": resolved_today,
+        "total_interactions": total_interactions,
+        "tool_calls": tool_calls,
+        "msgs_last_hour": msgs_last_hour,
+    })
+
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
+
+def _range_filter(range_param: str) -> Optional[str]:
+    """Convert a range parameter to an ISO 8601 cutoff string."""
+    now = datetime.now(timezone.utc)
+    if range_param == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif range_param == "7d":
+        cutoff = now - timedelta(days=7)
+    elif range_param == "30d":
+        cutoff = now - timedelta(days=30)
+    else:
+        return None
+    return cutoff.isoformat()
+
+# ---------------------------------------------------------------------------
+# Reporting page route
+# ---------------------------------------------------------------------------
+
+@app.get("/reporting")
+async def reporting_page(_session: SessionData = Depends(require_auth)) -> FileResponse:
+    return FileResponse(STATIC_DIR / "reporting.html")
+
+# ---------------------------------------------------------------------------
+# Reporting API endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/reporting/kpis")
+async def reporting_kpis(
+    range: str = "all",
+    _session: SessionData = Depends(require_auth),
+) -> JSONResponse:
+    cutoff = _range_filter(range)
+    where = "WHERE created_at >= ?" if cutoff else ""
+    params: list = [cutoff] if cutoff else []
+
+    async with _db.execute(f"SELECT COUNT(*) FROM interactions {where}", params) as cur:
+        total = (await cur.fetchone())[0]
+
+    async with _db.execute(
+        f"SELECT COUNT(*) FROM interactions {where + ' AND' if where else 'WHERE'} resolved_by_bot = 1",
+        params,
+    ) as cur:
+        bot_resolved = (await cur.fetchone())[0]
+
+    async with _db.execute(
+        f"SELECT COALESCE(AVG(message_count), 0) FROM interactions {where}",
+        params,
+    ) as cur:
+        avg_messages = round((await cur.fetchone())[0], 1)
+
+    today_cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    async with _db.execute(
+        "SELECT COUNT(*) FROM interactions WHERE created_at >= ?",
+        [today_cutoff],
+    ) as cur:
+        today_count = (await cur.fetchone())[0]
+
+    bot_pct = round(bot_resolved / total * 100, 1) if total > 0 else 0
+
+    return JSONResponse({
+        "total": total,
+        "bot_resolved_pct": bot_pct,
+        "avg_messages": avg_messages,
+        "today_count": today_count,
+    })
+
+
+@app.get("/api/reporting/interactions")
+async def reporting_interactions(
+    range: str = "all",
+    status: str = "",
+    source: str = "",
+    category: str = "",
+    sort: str = "created_at",
+    order: str = "desc",
+    page: int = 1,
+    per_page: int = 50,
+    _session: SessionData = Depends(require_auth),
+) -> JSONResponse:
+    conditions: list[str] = []
+    params: list = []
+
+    cutoff = _range_filter(range)
+    if cutoff:
+        conditions.append("created_at >= ?")
+        params.append(cutoff)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if source:
+        conditions.append("source = ?")
+        params.append(source)
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # Whitelist sort columns
+    allowed_sorts = {"created_at", "status", "source", "category", "requester_name", "message_count"}
+    sort_col = sort if sort in allowed_sorts else "created_at"
+    sort_dir = "ASC" if order.lower() == "asc" else "DESC"
+
+    # Total count
+    async with _db.execute(f"SELECT COUNT(*) FROM interactions {where}", params) as cur:
+        total = (await cur.fetchone())[0]
+
+    offset = (max(page, 1) - 1) * per_page
+    query = f"""
+        SELECT id, ticket_id, source, requester_name, category, subcategory,
+               status, resolved_by_bot, priority, message_count, tool_call_count,
+               created_at, resolved_at
+        FROM interactions {where}
+        ORDER BY {sort_col} {sort_dir}
+        LIMIT ? OFFSET ?
+    """
+    async with _db.execute(query, params + [per_page, offset]) as cur:
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    return JSONResponse({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": max(1, -(-total // per_page)),
+        "interactions": rows,
+    })
+
+
+@app.get("/api/reporting/breakdowns")
+async def reporting_breakdowns(
+    range: str = "all",
+    _session: SessionData = Depends(require_auth),
+) -> JSONResponse:
+    cutoff = _range_filter(range)
+    where = "WHERE created_at >= ?" if cutoff else ""
+    params: list = [cutoff] if cutoff else []
+
+    async def group_by(col: str) -> list[dict]:
+        q = f"SELECT {col} AS label, COUNT(*) AS count FROM interactions {where} GROUP BY {col} ORDER BY count DESC"
+        async with _db.execute(q, params) as cur:
+            return [{"label": r["label"] or "unknown", "count": r["count"]} for r in await cur.fetchall()]
+
+    by_category = await group_by("category")
+    by_source = await group_by("source")
+    by_status = await group_by("status")
+
+    # Top requesters
+    rq = f"""
+        SELECT requester_name AS label, COUNT(*) AS count
+        FROM interactions {where}
+        GROUP BY requester_name ORDER BY count DESC LIMIT 10
+    """
+    async with _db.execute(rq, params) as cur:
+        top_requesters = [{"label": r["label"] or "unknown", "count": r["count"]} for r in await cur.fetchall()]
+
+    return JSONResponse({
+        "by_category": by_category,
+        "by_source": by_source,
+        "by_status": by_status,
+        "top_requesters": top_requesters,
+    })
+
+
+@app.get("/api/reporting/interaction/{interaction_id}")
+async def reporting_interaction_detail(
+    interaction_id: int,
+    _session: SessionData = Depends(require_auth),
+) -> JSONResponse:
+    async with _db.execute(
+        "SELECT * FROM interactions WHERE id = ?", [interaction_id]
+    ) as cur:
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        interaction = dict(row)
+
+    async with _db.execute(
+        "SELECT role, content, timestamp FROM interaction_messages WHERE interaction_id = ? ORDER BY id",
+        [interaction_id],
+    ) as cur:
+        messages = [dict(r) for r in await cur.fetchall()]
+
+    async with _db.execute(
+        "SELECT tool_name, args, result_summary, timestamp FROM interaction_tool_calls WHERE interaction_id = ? ORDER BY id",
+        [interaction_id],
+    ) as cur:
+        tool_calls = [dict(r) for r in await cur.fetchall()]
+
+    return JSONResponse({
+        "interaction": interaction,
+        "messages": messages,
+        "tool_calls": tool_calls,
+    })
+
+
+@app.get("/api/reporting/interaction/by-ticket/{ticket_id}")
+async def reporting_interaction_by_ticket(
+    ticket_id: str,
+    _session: SessionData = Depends(require_auth),
+) -> JSONResponse:
+    """Look up an interaction by its ticket_id and return full detail."""
+    async with _db.execute(
+        "SELECT id FROM interactions WHERE ticket_id = ?", [ticket_id]
+    ) as cur:
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        interaction_id = row[0]
+    # Delegate to the existing detail handler
+    return await reporting_interaction_detail(interaction_id, _session)
 
 # ---------------------------------------------------------------------------
 # Broadcast

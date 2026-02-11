@@ -16,12 +16,23 @@
     .badge.dimmed { opacity: 0.3; }
     .pulse { animation: pulse 2s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .ticket-card { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+    .ticket-card:hover { border-color: #60a5fa; background: rgba(51,65,85,0.8); }
+    .ticket-card.selected { border-color: #3b82f6; background: rgba(30,58,95,0.6); }
+    .chat-user { background: #1e3a5f; border-radius: 12px 12px 12px 2px; }
+    .chat-bot { background: #1e293b; border-radius: 12px 12px 2px 12px; }
   </style>
 </head>
 <body class="min-h-screen">
   <!-- Header -->
   <header class="bg-slate-800 border-b border-slate-700 px-6 py-3 flex items-center justify-between">
-    <h1 class="text-xl font-bold text-white">IT Bot Dashboard</h1>
+    <div class="flex items-center gap-6">
+      <h1 class="text-xl font-bold text-white">IT Bot Dashboard</h1>
+      <nav class="flex gap-1">
+        <a href="/" class="text-sm px-3 py-1.5 rounded-md bg-slate-700 text-white transition-colors">Live</a>
+        <a href="/reporting" class="text-sm px-3 py-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-700 transition-colors">Reporting</a>
+      </nav>
+    </div>
     <div class="flex items-center gap-4">
       <div id="conn-status" class="flex items-center gap-2 text-sm">
         <span id="conn-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
@@ -44,12 +55,14 @@
       </div>
     </aside>
 
-    <!-- Center: Event Feed -->
-    <main class="flex-1 flex flex-col p-4">
+    <!-- Center: Event Feed + Ticket Detail -->
+    <main class="flex-1 flex flex-col p-4 overflow-hidden">
       <!-- Filter bar -->
       <div id="filter-bar" class="flex flex-wrap gap-1.5 mb-3"></div>
       <!-- Event feed -->
       <div id="event-feed" class="event-feed flex-1 space-y-1"></div>
+      <!-- Ticket detail panel (hidden by default) -->
+      <div id="ticket-detail" class="hidden flex-1 overflow-y-auto"></div>
     </main>
 
     <!-- Right sidebar: Recent Tool Calls -->
@@ -186,6 +199,10 @@
     feedEl.scrollTop = feedEl.scrollHeight;
   }
 
+  // --- Ticket detail state ---
+  const detailEl = document.getElementById('ticket-detail');
+  let selectedTicketKey = null;
+
   // --- Render ticket card ---
   function renderTickets() {
     const entries = Object.entries(state.tickets);
@@ -197,17 +214,153 @@
     entries.forEach(([tid, t]) => {
       const card = document.createElement('div');
       const statusColor = t.status === 'resolved' ? 'bg-green-600' : t.status === 'closed' ? 'bg-slate-600' : 'bg-yellow-600';
-      card.className = 'bg-slate-700/60 rounded-lg p-3 border border-slate-600';
+      card.className = `ticket-card bg-slate-700/60 rounded-lg p-3 border border-slate-600${selectedTicketKey === tid ? ' selected' : ''}`;
       card.innerHTML = `
         <div class="flex items-center justify-between mb-1">
-          <span class="text-xs font-mono text-blue-400">${tid}</span>
+          <span class="text-xs font-mono text-blue-400">${esc(tid)}</span>
           <span class="text-xs px-1.5 py-0.5 rounded ${statusColor} text-white">${t.status || 'open'}</span>
         </div>
         <p class="text-sm text-slate-200 leading-snug">${truncate(t.title, 80) || 'Untitled'}</p>
         ${t.priority ? `<span class="text-xs text-slate-400">Priority: ${t.priority}</span>` : ''}
       `;
+      card.addEventListener('click', () => openTicketDetail(tid, t));
       ticketsEl.appendChild(card);
     });
+  }
+
+  function esc(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function fmtDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  }
+
+  // --- Ticket detail ---
+  async function openTicketDetail(tid, ticket) {
+    // Toggle off if clicking the same ticket
+    if (selectedTicketKey === tid) {
+      closeTicketDetail();
+      return;
+    }
+
+    selectedTicketKey = tid;
+    renderTickets(); // re-render to show selected state
+
+    // Show detail panel, hide feed
+    feedEl.classList.add('hidden');
+    filterBar.parentElement.querySelector('#filter-bar').classList.add('hidden');
+    detailEl.classList.remove('hidden');
+    detailEl.innerHTML = '<p class="text-slate-500 text-sm py-8 text-center">Loading interaction...</p>';
+
+    // Determine which endpoint to call
+    let url;
+    if (ticket.db_id) {
+      url = `/api/reporting/interaction/${ticket.db_id}`;
+    } else {
+      url = `/api/reporting/interaction/by-ticket/${encodeURIComponent(tid)}`;
+    }
+
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        detailEl.innerHTML = '<p class="text-red-400 text-sm py-8 text-center">Could not load interaction details.</p>';
+        return;
+      }
+      const data = await res.json();
+      renderTicketDetail(tid, ticket, data);
+    } catch (e) {
+      detailEl.innerHTML = '<p class="text-red-400 text-sm py-8 text-center">Failed to fetch interaction.</p>';
+    }
+  }
+
+  function closeTicketDetail() {
+    selectedTicketKey = null;
+    detailEl.classList.add('hidden');
+    detailEl.innerHTML = '';
+    feedEl.classList.remove('hidden');
+    filterBar.parentElement.querySelector('#filter-bar').classList.remove('hidden');
+    renderTickets();
+  }
+
+  function renderTicketDetail(tid, ticket, data) {
+    const ix = data.interaction;
+    const statusColors = { open: 'bg-yellow-600', resolved: 'bg-green-600', escalated: 'bg-red-600', closed: 'bg-slate-600' };
+    const statusCls = statusColors[ix.status] || 'bg-slate-600';
+
+    let html = `
+      <div class="mb-4">
+        <button id="btn-back-to-feed" class="text-sm text-blue-400 hover:text-blue-300 mb-3 flex items-center gap-1">
+          <span>&larr;</span> Back to feed
+        </button>
+        <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+          <div class="flex flex-wrap items-center gap-3 mb-3">
+            <h3 class="text-lg font-semibold text-white">${esc(tid)}</h3>
+            <span class="text-xs px-2 py-0.5 rounded-full text-white ${statusCls}">${esc(ix.status)}</span>
+            ${ix.resolved_by_bot ? '<span class="text-xs text-green-400 font-semibold">Resolved by Bot</span>' : ''}
+          </div>
+          <div class="flex flex-wrap gap-4 text-sm text-slate-400 mb-1">
+            <span>Requester: <strong class="text-white">${esc(ix.requester_name)}</strong></span>
+            <span>Source: <strong class="text-white">${esc(ix.source)}</strong></span>
+            <span>Category: <strong class="text-white">${esc(ix.category) || '—'}</strong></span>
+            <span>Priority: <strong class="text-white">${esc(ix.priority)}</strong></span>
+            <span>Messages: <strong class="text-white">${ix.message_count}</strong></span>
+            <span>Created: <strong class="text-white">${fmtDateTime(ix.created_at)}</strong></span>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Messages
+    if (data.messages && data.messages.length > 0) {
+      html += '<div class="bg-slate-800 rounded-xl border border-slate-700 p-5 mb-4">';
+      html += '<h4 class="text-sm font-semibold text-slate-400 mb-3">Conversation</h4>';
+      html += '<div class="space-y-3 max-h-[50vh] overflow-y-auto pr-2">';
+      data.messages.forEach(m => {
+        const isUser = m.role === 'user';
+        const align = isUser ? 'items-start' : 'items-end';
+        const bubble = isUser ? 'chat-user' : 'chat-bot';
+        const label = isUser ? 'User' : 'Bot';
+        const labelColor = isUser ? 'text-blue-400' : 'text-teal-400';
+        html += `
+          <div class="flex flex-col ${align}">
+            <span class="text-xs ${labelColor} mb-0.5">${label} &mdash; ${fmtDateTime(m.timestamp)}</span>
+            <div class="${bubble} px-3 py-2 max-w-2xl text-sm text-slate-200 whitespace-pre-wrap">${esc(m.content)}</div>
+          </div>
+        `;
+      });
+      html += '</div></div>';
+    }
+
+    // Tool calls
+    if (data.tool_calls && data.tool_calls.length > 0) {
+      html += '<div class="bg-slate-800 rounded-xl border border-slate-700 p-5 mb-4">';
+      html += '<h4 class="text-sm font-semibold text-slate-400 mb-3">Tool Calls</h4>';
+      html += '<div class="space-y-2">';
+      data.tool_calls.forEach(tc => {
+        html += `
+          <div class="bg-slate-700/50 rounded px-3 py-2 text-sm">
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-indigo-300">${esc(tc.tool_name)}</span>
+              <span class="text-xs text-slate-500">${fmtDateTime(tc.timestamp)}</span>
+            </div>
+            <div class="text-xs text-slate-400 font-mono mt-1">${esc(tc.args)}</div>
+            ${tc.result_summary ? `<div class="text-xs text-green-400 mt-0.5">${esc(tc.result_summary)}</div>` : ''}
+          </div>
+        `;
+      });
+      html += '</div></div>';
+    }
+
+    detailEl.innerHTML = html;
+
+    // Wire up back button
+    document.getElementById('btn-back-to-feed').addEventListener('click', closeTicketDetail);
   }
 
   // --- Render tool calls ---
@@ -357,6 +510,55 @@
     };
   }
 
+  // --- Seed state from DB on page load ---
+  async function seedFromDB() {
+    try {
+      const res = await fetch('/api/live/init');
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // Populate tickets
+      for (const t of data.tickets) {
+        const key = t.ticket_id || `interaction-${t.id}`;
+        state.tickets[key] = {
+          db_id: t.id,
+          title: t.first_message || t.category || 'Untitled',
+          priority: t.priority || '',
+          status: t.status || 'open',
+          channel_id: t.channel_id || '',
+        };
+      }
+
+      // Stats
+      state.resolvedToday = data.resolved_today || 0;
+      state.totalEvents = data.total_interactions || 0;
+
+      // Seed msgs/hr with a synthetic count so the stat renders correctly
+      const now = Date.now() / 1000;
+      for (let i = 0; i < (data.msgs_last_hour || 0); i++) {
+        state.messageTimestamps.push(now);
+      }
+
+      // Recent tool calls
+      for (const tc of (data.tool_calls || []).reverse()) {
+        state.toolCalls.push({
+          tool_name: tc.tool_name,
+          detail: tc.result_summary || tc.args || '',
+          timestamp: new Date(tc.timestamp).getTime() / 1000,
+          _isResult: !!tc.result_summary,
+          success: !!tc.result_summary,
+        });
+      }
+
+      renderTickets();
+      renderTools();
+      updateStats();
+    } catch (e) {
+      console.error('Failed to seed from DB:', e);
+    }
+  }
+
+  seedFromDB();
   connect();
   // Refresh stats every 30s
   setInterval(updateStats, 30000);

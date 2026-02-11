@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IT Bot Dashboard — Reporting</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+    .pill { transition: all 0.15s; }
+    .pill.active { background: #3b82f6; color: #fff; }
+    .pill:not(.active) { background: #1e293b; color: #94a3b8; }
+    .pill:not(.active):hover { background: #334155; color: #e2e8f0; }
+    .sortable { cursor: pointer; user-select: none; }
+    .sortable:hover { color: #93c5fd; }
+    .row-clickable:hover { background: #1e293b; }
+    .chat-user { background: #1e3a5f; border-radius: 12px 12px 12px 2px; }
+    .chat-bot { background: #1e293b; border-radius: 12px 12px 2px 12px; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <!-- Header -->
+  <header class="bg-slate-800 border-b border-slate-700 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-6">
+      <h1 class="text-xl font-bold text-white">IT Bot Dashboard</h1>
+      <nav class="flex gap-1">
+        <a href="/" class="text-sm px-3 py-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-700 transition-colors">Live</a>
+        <a href="/reporting" class="text-sm px-3 py-1.5 rounded-md bg-slate-700 text-white transition-colors">Reporting</a>
+      </nav>
+    </div>
+    <button
+      onclick="fetch('/auth/logout',{method:'POST'}).then(()=>location.href='/login')"
+      class="text-sm px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors"
+    >Logout</button>
+  </header>
+
+  <main class="flex-1 overflow-y-auto p-6 space-y-6">
+
+    <!-- Time range pills -->
+    <div class="flex gap-2" id="range-pills">
+      <button class="pill text-sm px-4 py-1.5 rounded-full" data-range="today">Today</button>
+      <button class="pill text-sm px-4 py-1.5 rounded-full" data-range="7d">7 Days</button>
+      <button class="pill text-sm px-4 py-1.5 rounded-full" data-range="30d">30 Days</button>
+      <button class="pill text-sm px-4 py-1.5 rounded-full active" data-range="all">All Time</button>
+    </div>
+
+    <!-- KPI cards -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4" id="kpi-row">
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <p class="text-sm text-slate-400 mb-1">Total Interactions</p>
+        <p class="text-3xl font-bold text-white" id="kpi-total">—</p>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <p class="text-sm text-slate-400 mb-1">Resolved by Bot</p>
+        <p class="text-3xl font-bold text-green-400" id="kpi-bot-pct">—</p>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <p class="text-sm text-slate-400 mb-1">Avg Messages</p>
+        <p class="text-3xl font-bold text-blue-400" id="kpi-avg-msg">—</p>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <p class="text-sm text-slate-400 mb-1">Today's Count</p>
+        <p class="text-3xl font-bold text-amber-400" id="kpi-today">—</p>
+      </div>
+    </div>
+
+    <!-- Charts grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3">By Category</h3>
+        <canvas id="chart-category" height="220"></canvas>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3">By Source</h3>
+        <canvas id="chart-source" height="220"></canvas>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3">By Status</h3>
+        <canvas id="chart-status" height="220"></canvas>
+      </div>
+      <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3">Top Requesters</h3>
+        <canvas id="chart-requesters" height="220"></canvas>
+      </div>
+    </div>
+
+    <!-- Interactions table -->
+    <div class="bg-slate-800 rounded-xl border border-slate-700 p-5">
+      <div class="flex flex-wrap items-center gap-3 mb-4">
+        <h3 class="text-sm font-semibold text-slate-400">Interactions</h3>
+        <select id="filter-status" class="bg-slate-700 text-sm text-slate-300 rounded px-2 py-1 border border-slate-600">
+          <option value="">All Statuses</option>
+          <option value="open">Open</option>
+          <option value="resolved">Resolved</option>
+          <option value="escalated">Escalated</option>
+          <option value="closed">Closed</option>
+        </select>
+        <select id="filter-source" class="bg-slate-700 text-sm text-slate-300 rounded px-2 py-1 border border-slate-600">
+          <option value="">All Sources</option>
+          <option value="dm">DM</option>
+          <option value="help-it">help-it</option>
+        </select>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-slate-400 border-b border-slate-700">
+              <th class="sortable pb-2 pr-4" data-sort="created_at">Date <span id="sort-arrow-created_at" class="text-xs"></span></th>
+              <th class="pb-2 pr-4">Ticket</th>
+              <th class="sortable pb-2 pr-4" data-sort="requester_name">Requester <span id="sort-arrow-requester_name" class="text-xs"></span></th>
+              <th class="sortable pb-2 pr-4" data-sort="category">Category <span id="sort-arrow-category" class="text-xs"></span></th>
+              <th class="sortable pb-2 pr-4" data-sort="source">Source <span id="sort-arrow-source" class="text-xs"></span></th>
+              <th class="sortable pb-2 pr-4" data-sort="status">Status <span id="sort-arrow-status" class="text-xs"></span></th>
+              <th class="sortable pb-2 pr-4" data-sort="message_count">Msgs <span id="sort-arrow-message_count" class="text-xs"></span></th>
+            </tr>
+          </thead>
+          <tbody id="table-body" class="text-slate-300"></tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div class="flex items-center justify-between mt-4 text-sm text-slate-400">
+        <span id="page-info"></span>
+        <div class="flex gap-2">
+          <button id="btn-prev" class="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed" disabled>Prev</button>
+          <button id="btn-next" class="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed" disabled>Next</button>
+        </div>
+      </div>
+
+      <!-- Drill-down panel -->
+      <div id="detail-panel" class="hidden mt-4 border-t border-slate-700 pt-4"></div>
+    </div>
+
+  </main>
+
+<script>
+(function() {
+  // --- State ---
+  let currentRange = 'all';
+  let currentSort = 'created_at';
+  let currentOrder = 'desc';
+  let currentPage = 1;
+  let totalPages = 1;
+  let expandedId = null;
+
+  // --- Chart instances ---
+  let chartCategory = null;
+  let chartSource = null;
+  let chartStatus = null;
+  let chartRequesters = null;
+
+  // Chart color palette
+  const COLORS = [
+    '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6',
+    '#ec4899','#06b6d4','#84cc16','#f97316','#6366f1',
+  ];
+
+  // --- DOM refs ---
+  const kpiTotal = document.getElementById('kpi-total');
+  const kpiBotPct = document.getElementById('kpi-bot-pct');
+  const kpiAvgMsg = document.getElementById('kpi-avg-msg');
+  const kpiToday = document.getElementById('kpi-today');
+  const tableBody = document.getElementById('table-body');
+  const pageInfo = document.getElementById('page-info');
+  const btnPrev = document.getElementById('btn-prev');
+  const btnNext = document.getElementById('btn-next');
+  const detailPanel = document.getElementById('detail-panel');
+  const filterStatus = document.getElementById('filter-status');
+  const filterSource = document.getElementById('filter-source');
+
+  // --- Range pills ---
+  document.querySelectorAll('#range-pills .pill').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#range-pills .pill').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentRange = btn.dataset.range;
+      currentPage = 1;
+      expandedId = null;
+      detailPanel.classList.add('hidden');
+      loadAll();
+    });
+  });
+
+  // --- Filter dropdowns ---
+  filterStatus.addEventListener('change', () => { currentPage = 1; loadTable(); });
+  filterSource.addEventListener('change', () => { currentPage = 1; loadTable(); });
+
+  // --- Sort headers ---
+  document.querySelectorAll('.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.sort;
+      if (currentSort === col) {
+        currentOrder = currentOrder === 'desc' ? 'asc' : 'desc';
+      } else {
+        currentSort = col;
+        currentOrder = 'desc';
+      }
+      currentPage = 1;
+      loadTable();
+    });
+  });
+
+  // --- Pagination ---
+  btnPrev.addEventListener('click', () => { if (currentPage > 1) { currentPage--; loadTable(); } });
+  btnNext.addEventListener('click', () => { if (currentPage < totalPages) { currentPage++; loadTable(); } });
+
+  // --- API helpers ---
+  function qs(params) {
+    return Object.entries(params).filter(([,v]) => v !== '' && v != null).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  }
+
+  async function api(path, params = {}) {
+    const q = qs(params);
+    const url = q ? `${path}?${q}` : path;
+    const res = await fetch(url);
+    if (res.status === 401 || res.status === 302) { location.href = '/login'; return null; }
+    return res.json();
+  }
+
+  // --- Load all data ---
+  function loadAll() {
+    Promise.all([loadKPIs(), loadCharts(), loadTable()]);
+  }
+
+  // --- KPIs ---
+  async function loadKPIs() {
+    const data = await api('/api/reporting/kpis', { range: currentRange });
+    if (!data) return;
+    kpiTotal.textContent = data.total.toLocaleString();
+    kpiBotPct.textContent = data.bot_resolved_pct + '%';
+    kpiAvgMsg.textContent = data.avg_messages;
+    kpiToday.textContent = data.today_count.toLocaleString();
+  }
+
+  // --- Charts ---
+  async function loadCharts() {
+    const data = await api('/api/reporting/breakdowns', { range: currentRange });
+    if (!data) return;
+
+    chartCategory = rebuildDoughnut(chartCategory, 'chart-category', data.by_category);
+    chartSource = rebuildDoughnut(chartSource, 'chart-source', data.by_source);
+    chartStatus = rebuildBar(chartStatus, 'chart-status', data.by_status);
+    chartRequesters = rebuildBar(chartRequesters, 'chart-requesters', data.top_requesters);
+  }
+
+  function rebuildDoughnut(existing, canvasId, items) {
+    if (existing) existing.destroy();
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    return new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: items.map(i => i.label),
+        datasets: [{
+          data: items.map(i => i.count),
+          backgroundColor: COLORS.slice(0, items.length),
+          borderWidth: 0,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'right', labels: { color: '#94a3b8', boxWidth: 14, padding: 12 } },
+        },
+      },
+    });
+  }
+
+  function rebuildBar(existing, canvasId, items) {
+    if (existing) existing.destroy();
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    return new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: items.map(i => i.label),
+        datasets: [{
+          data: items.map(i => i.count),
+          backgroundColor: COLORS.slice(0, items.length),
+          borderRadius: 4,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        indexAxis: 'y',
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+          y: { ticks: { color: '#94a3b8' }, grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  // --- Table ---
+  async function loadTable() {
+    const data = await api('/api/reporting/interactions', {
+      range: currentRange,
+      status: filterStatus.value,
+      source: filterSource.value,
+      sort: currentSort,
+      order: currentOrder,
+      page: currentPage,
+      per_page: 50,
+    });
+    if (!data) return;
+
+    totalPages = data.pages;
+    currentPage = data.page;
+
+    // Update sort arrows
+    document.querySelectorAll('[id^="sort-arrow-"]').forEach(el => el.textContent = '');
+    const arrowEl = document.getElementById(`sort-arrow-${currentSort}`);
+    if (arrowEl) arrowEl.textContent = currentOrder === 'desc' ? ' ▼' : ' ▲';
+
+    // Render rows
+    tableBody.innerHTML = '';
+    if (data.interactions.length === 0) {
+      tableBody.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-slate-500">No interactions found</td></tr>';
+    } else {
+      data.interactions.forEach(row => {
+        const tr = document.createElement('tr');
+        tr.className = 'row-clickable border-b border-slate-700/50 cursor-pointer transition-colors';
+        tr.dataset.id = row.id;
+
+        const statusColors = {
+          open: 'bg-yellow-600', resolved: 'bg-green-600', escalated: 'bg-red-600', closed: 'bg-slate-600',
+        };
+        const statusCls = statusColors[row.status] || 'bg-slate-600';
+        const botBadge = row.resolved_by_bot ? ' <span class="text-xs text-green-400">✓ bot</span>' : '';
+
+        tr.innerHTML = `
+          <td class="py-2.5 pr-4 whitespace-nowrap text-slate-400">${fmtDate(row.created_at)}</td>
+          <td class="py-2.5 pr-4 font-mono text-xs text-blue-400">${row.ticket_id || '—'}</td>
+          <td class="py-2.5 pr-4">${esc(row.requester_name) || '—'}</td>
+          <td class="py-2.5 pr-4">${esc(row.category) || '—'}${row.subcategory ? ' / ' + esc(row.subcategory) : ''}</td>
+          <td class="py-2.5 pr-4">${esc(row.source)}</td>
+          <td class="py-2.5 pr-4"><span class="text-xs px-2 py-0.5 rounded-full text-white ${statusCls}">${row.status}</span>${botBadge}</td>
+          <td class="py-2.5 pr-4">${row.message_count}</td>
+        `;
+        tr.addEventListener('click', () => toggleDetail(row.id));
+        tableBody.appendChild(tr);
+      });
+    }
+
+    // Pagination controls
+    pageInfo.textContent = `Page ${currentPage} of ${totalPages} (${data.total} total)`;
+    btnPrev.disabled = currentPage <= 1;
+    btnNext.disabled = currentPage >= totalPages;
+
+    // If expanded row is no longer visible, hide detail
+    if (expandedId && !data.interactions.find(r => r.id === expandedId)) {
+      detailPanel.classList.add('hidden');
+      expandedId = null;
+    }
+  }
+
+  // --- Drill-down ---
+  async function toggleDetail(id) {
+    if (expandedId === id) {
+      detailPanel.classList.add('hidden');
+      expandedId = null;
+      return;
+    }
+    expandedId = id;
+    detailPanel.classList.remove('hidden');
+    detailPanel.innerHTML = '<p class="text-slate-500 text-sm">Loading...</p>';
+
+    const data = await api(`/api/reporting/interaction/${id}`);
+    if (!data) return;
+
+    const ix = data.interaction;
+    let html = `
+      <div class="flex flex-wrap gap-4 mb-4 text-sm">
+        <span class="text-slate-400">ID: <strong class="text-white">${ix.id}</strong></span>
+        ${ix.ticket_id ? `<span class="text-slate-400">Ticket: <strong class="text-blue-400">${esc(ix.ticket_id)}</strong></span>` : ''}
+        <span class="text-slate-400">Status: <strong class="text-white">${esc(ix.status)}</strong></span>
+        <span class="text-slate-400">Source: <strong class="text-white">${esc(ix.source)}</strong></span>
+        <span class="text-slate-400">Category: <strong class="text-white">${esc(ix.category) || '—'}</strong></span>
+        <span class="text-slate-400">Priority: <strong class="text-white">${esc(ix.priority)}</strong></span>
+        ${ix.resolved_by_bot ? '<span class="text-green-400 font-semibold">Resolved by Bot</span>' : ''}
+      </div>
+    `;
+
+    // Messages
+    if (data.messages.length > 0) {
+      html += '<h4 class="text-sm font-semibold text-slate-400 mb-2">Messages</h4><div class="space-y-2 mb-4 max-h-96 overflow-y-auto">';
+      data.messages.forEach(m => {
+        const isUser = m.role === 'user';
+        const align = isUser ? 'items-start' : 'items-end';
+        const bubble = isUser ? 'chat-user' : 'chat-bot';
+        const label = isUser ? 'User' : 'Bot';
+        const labelColor = isUser ? 'text-blue-400' : 'text-teal-400';
+        html += `
+          <div class="flex flex-col ${align}">
+            <span class="text-xs ${labelColor} mb-0.5">${label} — ${fmtDateTime(m.timestamp)}</span>
+            <div class="${bubble} px-3 py-2 max-w-2xl text-sm text-slate-200 whitespace-pre-wrap">${esc(m.content)}</div>
+          </div>
+        `;
+      });
+      html += '</div>';
+    }
+
+    // Tool calls
+    if (data.tool_calls.length > 0) {
+      html += '<h4 class="text-sm font-semibold text-slate-400 mb-2">Tool Calls</h4><div class="space-y-1">';
+      data.tool_calls.forEach(tc => {
+        html += `
+          <div class="bg-slate-700/50 rounded px-3 py-2 text-sm">
+            <span class="font-semibold text-indigo-300">${esc(tc.tool_name)}</span>
+            <span class="text-xs text-slate-500 ml-2">${fmtDateTime(tc.timestamp)}</span>
+            <div class="text-xs text-slate-400 font-mono mt-1">${esc(tc.args)}</div>
+            ${tc.result_summary ? `<div class="text-xs text-green-400 mt-0.5">${esc(tc.result_summary)}</div>` : ''}
+          </div>
+        `;
+      });
+      html += '</div>';
+    }
+
+    detailPanel.innerHTML = html;
+  }
+
+  // --- Helpers ---
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+
+  function fmtDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  }
+
+  function esc(s) {
+    if (!s) return '';
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  // --- Init ---
+  loadAll();
+})();
+</script>
+</body>
+</html>
