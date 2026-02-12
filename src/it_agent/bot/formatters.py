@@ -235,6 +235,10 @@ def redact_recommendations(text: str, recommendations: list[dict]) -> str:
         if span and span in redacted:
             redacted = redacted.replace(span, "")
 
+    # Clean up orphaned numbered list items (e.g. "2.  \n" left after redaction)
+    redacted = re.sub(r"^\s*\d+\.\s*$", "", redacted, flags=re.MULTILINE)
+    # Clean up orphaned bullet points
+    redacted = re.sub(r"^\s*[\*\-]\s*$", "", redacted, flags=re.MULTILINE)
     # Clean up leftover blank lines
     while "\n\n\n" in redacted:
         redacted = redacted.replace("\n\n\n", "\n\n")

@@ -932,12 +932,17 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         # Check if channel already exists (idempotent)
         for ch_id, ctx in _incident_context.items():
             if ctx.get("ticket_id") == ticket_id:
-                # Channel already created — update the button message
+                # Ensure the button-clicker is in the channel
+                try:
+                    await client.conversations_invite(channel=ch_id, users=button_user_id)
+                except Exception:
+                    pass  # already_in_channel or other — not critical
+                # Update the button message
                 try:
                     await client.chat_update(
                         channel=channel,
                         ts=message_ts,
-                        text=f":white_check_mark: Private channel <#{ch_id}> has been created for {ticket_id}.",
+                        text=f":white_check_mark: Private channel <#{ch_id}> already exists for {ticket_id}.",
                         blocks=[{
                             "type": "section",
                             "text": {
@@ -948,6 +953,16 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     )
                 except Exception:
                     logger.debug("Failed to update button message", exc_info=True)
+                # Send ephemeral nudge to the user who clicked
+                try:
+                    await client.chat_postEphemeral(
+                        channel=channel,
+                        user=button_user_id,
+                        text=f":arrow_right: Head over to <#{ch_id}> to continue troubleshooting {ticket_id}.",
+                        thread_ts=thread_ts,
+                    )
+                except Exception:
+                    logger.debug("Failed to send ephemeral redirect", exc_info=True)
                 return
 
         # Create the channel
@@ -996,6 +1011,17 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             )
         except Exception:
             logger.debug("Failed to post channel created thread message", exc_info=True)
+
+        # Send ephemeral nudge to the user who clicked
+        try:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=button_user_id,
+                text=f":arrow_right: Head over to <#{channel_id}> to continue troubleshooting {ticket_id}.",
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.debug("Failed to send ephemeral redirect", exc_info=True)
 
     # --- Archive channel now action ---
 
@@ -1138,10 +1164,25 @@ async def _register_incident_channels(result: AgentResult) -> None:
 # ---------------------------------------------------------------------------
 
 _BASIC_RECOMMENDATIONS = {
+    # General
     "restart", "reboot", "check cables", "clear cache", "clear browser cache",
     "try again", "log out and log back in", "sign out and sign back in",
     "check internet connection", "check your internet", "update your browser",
     "close and reopen", "power cycle", "unplug and replug",
+    # VPN / WiFi
+    "connect vpn", "disconnect vpn", "reconnect vpn", "disconnect and reconnect",
+    "connect to vpn", "ensure vpn is connected", "check vpn", "toggle vpn",
+    "connect wifi", "reconnect wifi", "disconnect and reconnect wifi",
+    "forget network and reconnect", "rejoin network",
+    # Mac hardware troubleshooting
+    "reset smc", "smc reset", "perform smc reset",
+    "reset nvram", "nvram reset", "reset pram", "pram reset",
+    "boot safe mode", "safe mode", "boot into safe mode",
+    "hold power button", "press and hold power",
+    "reset battery", "recalibrate battery",
+    # Windows hardware troubleshooting
+    "run sfc", "system file checker", "check disk",
+    "boot safe mode windows", "safe mode with networking",
 }
 
 
@@ -1189,7 +1230,11 @@ async def _extract_recommendations(
             canonical = rec.get("canonical_form", "").lower().strip()
             if not canonical:
                 continue
-            is_basic = any(basic in canonical for basic in _BASIC_RECOMMENDATIONS)
+            canonical_words = set(canonical.split())
+            is_basic = any(
+                set(basic.split()).issubset(canonical_words)
+                for basic in _BASIC_RECOMMENDATIONS
+            )
             if not is_basic:
                 filtered.append(rec)
 
@@ -1316,7 +1361,14 @@ async def _gate_recommendations(
         say_kwargs["thread_ts"] = thread_ts
 
     msg_response = await say(**say_kwargs)
-    posted_ts = msg_response.get("ts", "") if isinstance(msg_response, dict) else ""
+    posted_ts = ""
+    if msg_response is not None:
+        if isinstance(msg_response, dict):
+            posted_ts = msg_response.get("ts", "")
+        elif hasattr(msg_response, "get"):
+            posted_ts = msg_response.get("ts", "")
+        elif hasattr(msg_response, "data"):
+            posted_ts = msg_response.data.get("ts", "")
 
     # 5. Store pending approval in DB
     rec_ids = [r["db_id"] for r in untrusted if r.get("db_id")]
