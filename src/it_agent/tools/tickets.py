@@ -155,19 +155,21 @@ async def create_ticket(
         except Exception:
             logger.warning("Could not resolve Slack user %s to SN sys_id", _user_id, exc_info=True)
 
+    incident_data = {
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "category": category,
+        "caller_id": caller_id,
+    }
+    if _settings.sn_bot_user_sys_id:
+        incident_data["assigned_to"] = _settings.sn_bot_user_sys_id
+
     client = ServiceNowClient(
         _settings.sn_instance_url, _settings.sn_username, _settings.sn_password
     )
     try:
-        incident = await client.create_incident(
-            {
-                "title": title,
-                "description": description,
-                "priority": priority,
-                "category": category,
-                "caller_id": caller_id,
-            }
-        )
+        incident = await client.create_incident(incident_data)
     finally:
         await client.close()
 
@@ -221,6 +223,7 @@ async def update_ticket(
     requester_id: str | None = None,
     comment: str | None = None,
     close_notes: str | None = None,
+    additional_assignee_list: str | None = None,
     _settings: Settings | None = None,
     _user_id: str = "unknown",
     **_,
@@ -251,6 +254,8 @@ async def update_ticket(
             update_data["comment"] = comment
         if close_notes:
             update_data["close_notes"] = close_notes
+        if additional_assignee_list:
+            update_data["additional_assignee_list"] = additional_assignee_list
 
         updated = await client.update_incident(
             incident["sys_id"], update_data, current_state=incident.get("_raw_state", "1")

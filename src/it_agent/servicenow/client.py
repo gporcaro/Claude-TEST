@@ -50,6 +50,7 @@ def _normalize_incident(record: dict) -> dict:
         "contact_type": record.get("contact_type", ""),
         "requester_id": record.get("caller_id", ""),
         "assignee_id": record.get("assigned_to", ""),
+        "additional_assignee_list": record.get("additional_assignee_list", ""),
         "created_at": record.get("sys_created_on", ""),
         "updated_at": record.get("sys_updated_on", ""),
     }
@@ -93,6 +94,8 @@ class ServiceNowClient:
             payload["category"] = data["category"]
         if data.get("caller_id"):
             payload["caller_id"] = data["caller_id"]
+        if data.get("assigned_to"):
+            payload["assigned_to"] = data["assigned_to"]
 
         resp = await self._client.post(
             f"{self.base_url}/table/incident", json=payload
@@ -160,6 +163,8 @@ class ServiceNowClient:
             payload["caller_id"] = data["requester_id"]
         if "comment" in data:
             payload["comments"] = data["comment"]
+        if "additional_assignee_list" in data:
+            payload["additional_assignee_list"] = data["additional_assignee_list"]
 
         # ServiceNow requires close_code + close_notes for resolved/closed
         if target_status in ("resolved", "closed"):

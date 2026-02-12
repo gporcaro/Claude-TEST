@@ -216,6 +216,33 @@ _ESCALATION_PATTERNS = re.compile(
 )
 
 
+async def _unassign_bot_on_escalation(ticket_id: str, settings: Settings) -> None:
+    """Remove bot as primary assignee, keep as additional assignee."""
+    if not settings.sn_bot_user_sys_id:
+        return
+    client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password,
+    )
+    try:
+        incident = await client.get_incident(ticket_id)
+        if incident is None:
+            return
+        # Only unassign if bot is currently the primary assignee
+        if incident.get("assignee_id") != settings.sn_bot_user_sys_id:
+            return
+        await client.update_incident(
+            incident["sys_id"],
+            {
+                "assignee_id": "",
+                "additional_assignee_list": settings.sn_bot_user_sys_id,
+            },
+            current_state=incident.get("_raw_state", "1"),
+        )
+        logger.info("Unassigned bot from %s, added as additional assignee", ticket_id)
+    finally:
+        await client.close()
+
+
 def _recover_ticket_thread_mapping(
     channel: str, thread_ts: str, history: list[dict],
 ) -> str | None:
@@ -1428,6 +1455,7 @@ async def _handle_help_channel_message(
             if already_has_channel:
                 continue
             logger.info("Escalation detected: auto-creating channel for %s", tc_ticket_id)
+            await _unassign_bot_on_escalation(tc_ticket_id, settings)
             ch_result = await _create_deferred_channel(
                 tc_ticket_id, settings,
                 thread_info=(channel, thread_ts),
@@ -1467,6 +1495,7 @@ async def _handle_help_channel_message(
                         "Keyword escalation fallback: creating channel for %s",
                         fallback_ticket_id,
                     )
+                    await _unassign_bot_on_escalation(fallback_ticket_id, settings)
                     ch_result = await _create_deferred_channel(
                         fallback_ticket_id, settings,
                         thread_info=(channel, thread_ts),
@@ -1628,6 +1657,8 @@ async def _handle_ticket_assigned(
 
     If no channel exists yet (deferred flow), auto-creates one first.
     """
+    await _unassign_bot_on_escalation(ticket_id, settings)
+
     # Reverse-lookup: find channel_id whose context has this ticket_id
     channel_id: str | None = None
     for ch_id, ctx in _incident_context.items():

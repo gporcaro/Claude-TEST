@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     sn_username: str
     sn_password: str
 
+    # Bot identity (for self-assignment)
+    sn_bot_user_sys_id: str = ""  # env var: SN_BOT_USER_SYS_ID
+
     # Channel configuration
     help_channel_id: str = ""  # env var: HELP_CHANNEL_ID
 
