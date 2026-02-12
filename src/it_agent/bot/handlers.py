@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -17,8 +18,10 @@ from it_agent.bot.formatters import (
     format_approval_blocks,
     format_error_blocks,
     format_public_article_blocks,
+    format_recommendation_approval_blocks,
     format_response_blocks,
     linkify_servicenow_refs,
+    redact_recommendations,
 )
 from it_agent.config import Settings
 from it_agent import db
@@ -606,6 +609,136 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         await emit("article_denied", {"article_id": article_id, "denier": denier_name})
 
+    # --- Recommendation approval actions ---
+
+    @app.action("approve_recommendation")
+    async def handle_approve_recommendation(ack, body) -> None:
+        await ack()
+        approval_id = int(body["actions"][0]["value"])
+        approver_id = body["user"]["id"]
+        approver_name = await _resolve_user_name(approver_id, settings)
+
+        approval = await db.get_pending_rec_approval(approval_id)
+        if not approval or approval["status"] != "pending":
+            return
+
+        await db.update_pending_rec_approval(approval_id, status="approved")
+
+        # Increment approval counts and promote to trusted if threshold reached
+        rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+        for rec_id in rec_ids:
+            updated_rec = await db.increment_recommendation_approval(rec_id)
+            if (
+                updated_rec
+                and updated_rec["status"] != "trusted"
+                and updated_rec["approval_count"] >= settings.recommendation_trust_threshold
+            ):
+                await db.update_recommendation(rec_id, status="trusted")
+                logger.info(
+                    "Recommendation %d promoted to trusted (count %d)",
+                    rec_id, updated_rec["approval_count"],
+                )
+
+        # Update the user's message with the full original response
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            sn_url = settings.sn_instance_url
+            original = approval["original_text"]
+            linked = linkify_servicenow_refs(original, sn_url)
+            blocks = format_response_blocks(original, sn_url)
+            await client.chat_update(
+                channel=approval["channel_id"],
+                ts=approval["message_ts"],
+                text=linked,
+                blocks=blocks,
+            )
+        except Exception:
+            logger.debug("Failed to update user message on recommendation approval", exc_info=True)
+
+        # Update the #it-helpdesk approval message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            ch = approval.get("approval_channel") or body["channel"]["id"]
+            ts = approval.get("approval_message_ts") or body["message"]["ts"]
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=f":white_check_mark: Recommendations approved by {approver_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":white_check_mark: Recommendations approved by {approver_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update recommendation approval message", exc_info=True)
+
+        await emit("recommendation_approved", {
+            "approval_id": approval_id, "approver": approver_name,
+        })
+
+    @app.action("deny_recommendation")
+    async def handle_deny_recommendation(ack, body) -> None:
+        await ack()
+        approval_id = int(body["actions"][0]["value"])
+        denier_id = body["user"]["id"]
+        denier_name = await _resolve_user_name(denier_id, settings)
+
+        approval = await db.get_pending_rec_approval(approval_id)
+        if not approval or approval["status"] != "pending":
+            return
+
+        await db.update_pending_rec_approval(approval_id, status="denied")
+
+        # Increment denial counts
+        rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+        for rec_id in rec_ids:
+            await db.increment_recommendation_denial(rec_id)
+
+        # Update the user's message with denial notice
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            denial_text = (
+                f"{approval['redacted_text'].rsplit(':hourglass_flowing_sand:', 1)[0].rstrip()}"
+                "\n\n:no_entry: _The specific troubleshooting steps were reviewed and not approved by IT. "
+                "Please contact the help desk for further assistance._"
+            )
+            blocks = format_response_blocks(denial_text, settings.sn_instance_url)
+            await client.chat_update(
+                channel=approval["channel_id"],
+                ts=approval["message_ts"],
+                text=denial_text,
+                blocks=blocks,
+            )
+        except Exception:
+            logger.debug("Failed to update user message on recommendation denial", exc_info=True)
+
+        # Update the #it-helpdesk message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            ch = approval.get("approval_channel") or body["channel"]["id"]
+            ts = approval.get("approval_message_ts") or body["message"]["ts"]
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=f":no_entry: Recommendations denied by {denier_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":no_entry: Recommendations denied by {denier_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update recommendation denial message", exc_info=True)
+
+        await emit("recommendation_denied", {
+            "approval_id": approval_id, "denier": denier_name,
+        })
+
     # --- Move to private channel action ---
 
     @app.action("move_to_private_channel")
@@ -729,6 +862,230 @@ async def _register_incident_channels(result: AgentResult) -> None:
             })
 
 
+# ---------------------------------------------------------------------------
+# Recommendation approval gate
+# ---------------------------------------------------------------------------
+
+_BASIC_RECOMMENDATIONS = {
+    "restart", "reboot", "check cables", "clear cache", "clear browser cache",
+    "try again", "log out and log back in", "sign out and sign back in",
+    "check internet connection", "check your internet", "update your browser",
+    "close and reopen", "power cycle", "unplug and replug",
+}
+
+
+async def _extract_recommendations(
+    response_text: str, settings: Settings,
+) -> list[dict]:
+    """Use Gemini to extract actionable recommendations from the agent's response.
+
+    Returns a list of ``{original_text, canonical_form, category}`` dicts.
+    Basic suggestions (restart, check cables, clear cache) are excluded.
+    Returns ``[]`` on failure so the response posts normally.
+    """
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=(
+                "Analyze the following IT support response and extract ONLY specific, "
+                "actionable recommendations that involve changing settings, installing "
+                "software, running commands, modifying configuration, or disabling features. "
+                "Do NOT include basic/generic advice like: restart, reboot, check cables, "
+                "clear cache, try again, log out/in, check internet, update browser, "
+                "close and reopen, power cycle.\n\n"
+                "For each recommendation found, output a JSON array of objects with:\n"
+                '- "original_text": the exact text span from the response\n'
+                '- "canonical_form": a short normalized version (e.g. "disable hardware acceleration in Chrome")\n'
+                '- "category": one of "settings_change", "install", "command", "config_change", "feature_toggle"\n\n'
+                "If there are NO specific actionable recommendations, return an empty array: []\n\n"
+                "IMPORTANT: Return ONLY the JSON array, no other text.\n\n"
+                f"Response to analyze:\n{response_text}"
+            ),
+        )
+        raw = (response.text or "").strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        recommendations = json.loads(raw)
+        if not isinstance(recommendations, list):
+            return []
+
+        # Safety-net filter: remove anything that matches basic recommendations
+        filtered = []
+        for rec in recommendations:
+            canonical = rec.get("canonical_form", "").lower().strip()
+            if not canonical:
+                continue
+            is_basic = any(basic in canonical for basic in _BASIC_RECOMMENDATIONS)
+            if not is_basic:
+                filtered.append(rec)
+
+        return filtered
+    except Exception:
+        logger.debug("Failed to extract recommendations from response", exc_info=True)
+        return []
+
+
+async def _match_recommendations_to_db(
+    recommendations: list[dict], settings: Settings,
+) -> list[dict]:
+    """Match extracted recommendations against the DB.
+
+    For each recommendation:
+    1. Exact match on canonical_form
+    2. If no match, Gemini semantic match against all existing canonical forms
+    3. If still no match, create a new 'pending' entry
+
+    Enriches each dict with ``db_id``, ``db_status``, ``is_trusted``.
+    """
+    all_existing = await db.get_all_recommendations()
+    existing_map = {r["canonical_form"]: r for r in all_existing}
+    existing_canonicals = list(existing_map.keys())
+
+    for rec in recommendations:
+        canonical = rec.get("canonical_form", "").strip()
+
+        # 1. Exact match
+        db_rec = existing_map.get(canonical)
+        if db_rec:
+            rec["db_id"] = db_rec["id"]
+            rec["db_status"] = db_rec["status"]
+            rec["is_trusted"] = db_rec["status"] == "trusted"
+            continue
+
+        # 2. Semantic match via Gemini
+        if existing_canonicals:
+            try:
+                client = genai.Client(api_key=settings.gemini_api_key)
+                response = await client.aio.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=(
+                        "Given this recommendation:\n"
+                        f'"{canonical}"\n\n'
+                        "Does it match any of these existing canonical forms? "
+                        "A match means they describe the same action even if worded differently.\n\n"
+                        + "\n".join(f"- {c}" for c in existing_canonicals)
+                        + "\n\nIf there is a match, respond with ONLY the matching canonical form text. "
+                        "If there is NO match, respond with exactly: NO_MATCH"
+                    ),
+                )
+                match_text = (response.text or "").strip()
+                if match_text != "NO_MATCH" and match_text in existing_map:
+                    db_rec = existing_map[match_text]
+                    rec["db_id"] = db_rec["id"]
+                    rec["db_status"] = db_rec["status"]
+                    rec["is_trusted"] = db_rec["status"] == "trusted"
+                    rec["canonical_form"] = match_text  # normalize
+                    continue
+            except Exception:
+                logger.debug("Semantic match failed for: %s", canonical, exc_info=True)
+
+        # 3. No match — create new pending entry
+        try:
+            new_id = await db.create_recommendation(
+                canonical, rec.get("category", ""), "pending",
+            )
+            rec["db_id"] = new_id
+            rec["db_status"] = "pending"
+            rec["is_trusted"] = False
+            # Add to local map so subsequent recs in same batch can match
+            new_rec = await db.get_recommendation(new_id)
+            if new_rec:
+                existing_map[canonical] = new_rec
+                existing_canonicals.append(canonical)
+        except Exception:
+            logger.debug("Failed to create recommendation record for: %s", canonical, exc_info=True)
+            rec["db_id"] = None
+            rec["db_status"] = "pending"
+            rec["is_trusted"] = False
+
+    return recommendations
+
+
+async def _gate_recommendations(
+    response_text: str,
+    channel: str,
+    thread_ts: str | None,
+    say,
+    settings: Settings,
+    *,
+    interaction_id: int | None = None,
+    user_name: str = "a user",
+) -> tuple[str, str | None]:
+    """Orchestrate recommendation approval gating.
+
+    Returns ``(final_text, message_ts_or_None)``.
+    If ``message_ts`` is not None, the caller should skip its own ``say()``
+    because a redacted message has already been posted.
+    """
+    # 1. Extract recommendations
+    recommendations = await _extract_recommendations(response_text, settings)
+    if not recommendations:
+        return response_text, None
+
+    # 2. Match against DB
+    recommendations = await _match_recommendations_to_db(recommendations, settings)
+
+    # 3. Check if all are trusted
+    if all(r.get("is_trusted") for r in recommendations):
+        return response_text, None
+
+    # 4. Gate: redact + post + store
+    untrusted = [r for r in recommendations if not r.get("is_trusted")]
+    redacted_text = redact_recommendations(response_text, untrusted)
+
+    sn_url = settings.sn_instance_url
+    linked_redacted = linkify_servicenow_refs(redacted_text, sn_url)
+    blocks = format_response_blocks(redacted_text, sn_url)
+
+    say_kwargs: dict = {"text": linked_redacted, "blocks": blocks}
+    if thread_ts:
+        say_kwargs["thread_ts"] = thread_ts
+
+    msg_response = await say(**say_kwargs)
+    posted_ts = msg_response.get("ts", "") if isinstance(msg_response, dict) else ""
+
+    # 5. Store pending approval in DB
+    rec_ids = [r["db_id"] for r in untrusted if r.get("db_id")]
+    try:
+        approval_id = await db.create_pending_rec_approval(
+            channel_id=channel,
+            message_ts=posted_ts,
+            original_text=response_text,
+            redacted_text=redacted_text,
+            recommendation_ids=rec_ids,
+            thread_ts=thread_ts or "",
+            interaction_id=interaction_id,
+        )
+    except Exception:
+        logger.warning("Failed to store pending recommendation approval", exc_info=True)
+        return response_text, None
+
+    # 6. Post approval request to #it-helpdesk
+    if settings.it_helpdesk_channel_id:
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            approval_blocks = format_recommendation_approval_blocks(
+                approval_id, untrusted, response_text, user_name,
+            )
+            resp = await client.chat_postMessage(
+                channel=settings.it_helpdesk_channel_id,
+                text=f"Recommendation approval needed from {user_name}",
+                blocks=approval_blocks,
+            )
+            await db.update_pending_rec_approval(
+                approval_id,
+                approval_message_ts=resp["ts"],
+                approval_channel=settings.it_helpdesk_channel_id,
+            )
+        except Exception:
+            logger.warning("Failed to post recommendation approval request", exc_info=True)
+
+    return redacted_text, posted_ts
+
+
 async def _handle_message(event: dict, text: str, say, settings: Settings) -> None:
     """Process a user message through the agent (DM / mention flow)."""
     channel = event["channel"]
@@ -787,10 +1144,17 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         if iid is not None:
             await _record_agent_result(iid, text, result)
 
-        sn_url = settings.sn_instance_url
-        linked_text = linkify_servicenow_refs(result.text, sn_url)
-        blocks = format_response_blocks(result.text, sn_url)
-        await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+        # Recommendation approval gate
+        user_display = await _resolve_user_name(user_id, settings)
+        final_text, gated_msg_ts = await _gate_recommendations(
+            result.text, channel, thread_ts, say, settings,
+            interaction_id=iid, user_name=user_display,
+        )
+        if gated_msg_ts is None:
+            sn_url = settings.sn_instance_url
+            linked_text = linkify_servicenow_refs(result.text, sn_url)
+            blocks = format_response_blocks(result.text, sn_url)
+            await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
@@ -1013,10 +1377,17 @@ async def _handle_incident_message(
         if iid is not None:
             await _record_agent_result(iid, text, result)
 
-        sn_url = settings.sn_instance_url
-        linked_text = linkify_servicenow_refs(result.text, sn_url)
-        blocks = format_response_blocks(result.text, sn_url)
-        await say(text=linked_text, blocks=blocks)
+        # Recommendation approval gate
+        user_display = await _resolve_user_name(user_id, settings)
+        final_text, gated_msg_ts = await _gate_recommendations(
+            result.text, channel, None, say, settings,
+            interaction_id=iid, user_name=user_display,
+        )
+        if gated_msg_ts is None:
+            sn_url = settings.sn_instance_url
+            linked_text = linkify_servicenow_refs(result.text, sn_url)
+            blocks = format_response_blocks(result.text, sn_url)
+            await say(text=linked_text, blocks=blocks)
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
@@ -1455,10 +1826,17 @@ async def _handle_help_channel_message(
         if iid is not None:
             await _record_agent_result(iid, text, result)
 
-        sn_url = settings.sn_instance_url
-        linked_text = linkify_servicenow_refs(result.text, sn_url)
-        blocks = format_response_blocks(result.text, sn_url)
-        await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+        # Recommendation approval gate
+        user_display = await _resolve_user_name(user_id, settings)
+        final_text, gated_msg_ts = await _gate_recommendations(
+            result.text, channel, thread_ts, say, settings,
+            interaction_id=iid, user_name=user_display,
+        )
+        if gated_msg_ts is None:
+            sn_url = settings.sn_instance_url
+            linked_text = linkify_servicenow_refs(result.text, sn_url)
+            blocks = format_response_blocks(result.text, sn_url)
+            await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
         # ── Post ticket follow-up with "Move to private channel" button ──
         if auto_ticket_info and auto_ticket_info.get("success"):
@@ -2049,3 +2427,84 @@ async def _process_expired_approvals(settings: Settings) -> None:
                 logger.debug("Failed to update expired approval message for article %d", article_id, exc_info=True)
 
         await emit("article_auto_denied", {"article_id": article_id})
+
+
+# ---------------------------------------------------------------------------
+# Recommendation approval timeout loop
+# ---------------------------------------------------------------------------
+
+async def start_recommendation_timeout_loop(settings: Settings) -> None:
+    """Background loop that auto-denies recommendation approvals older than 30 minutes."""
+    while True:
+        await asyncio.sleep(_APPROVAL_CHECK_INTERVAL)
+        try:
+            await _process_expired_rec_approvals(settings)
+        except Exception:
+            logger.warning("Recommendation timeout loop iteration failed", exc_info=True)
+
+
+async def _process_expired_rec_approvals(settings: Settings) -> None:
+    """Auto-deny recommendation approvals older than the timeout."""
+    expired = await db.get_expired_rec_approvals(older_than_minutes=_APPROVAL_TIMEOUT_MINUTES)
+    if not expired:
+        return
+
+    logger.info("Auto-denying %d expired recommendation approval(s)", len(expired))
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    for approval in expired:
+        approval_id = approval["id"]
+        await db.update_pending_rec_approval(approval_id, status="denied")
+
+        # Increment denial counts
+        rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+        for rec_id in rec_ids:
+            await db.increment_recommendation_denial(rec_id)
+
+        # Update the user's message with timeout notice
+        try:
+            timeout_text = (
+                f"{approval['redacted_text'].rsplit(':hourglass_flowing_sand:', 1)[0].rstrip()}"
+                "\n\n:hourglass: _The specific troubleshooting steps were not reviewed in time "
+                "and have been removed. Please contact the help desk for further assistance._"
+            )
+            blocks = format_response_blocks(timeout_text, settings.sn_instance_url)
+            await client.chat_update(
+                channel=approval["channel_id"],
+                ts=approval["message_ts"],
+                text=timeout_text,
+                blocks=blocks,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to update user message for expired recommendation %d",
+                approval_id, exc_info=True,
+            )
+
+        # Update the #it-helpdesk message
+        msg_ts = approval.get("approval_message_ts")
+        ch = approval.get("approval_channel")
+        if msg_ts and ch:
+            try:
+                await client.chat_update(
+                    channel=ch,
+                    ts=msg_ts,
+                    text=f":hourglass: Recommendations auto-denied (timed out after {_APPROVAL_TIMEOUT_MINUTES}min)",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f":hourglass: Recommendations auto-denied "
+                                f"(timed out after {_APPROVAL_TIMEOUT_MINUTES}min)"
+                            ),
+                        },
+                    }],
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to update expired recommendation approval message %d",
+                    approval_id, exc_info=True,
+                )
+
+        await emit("recommendation_auto_denied", {"approval_id": approval_id})

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # Public KB
     public_trust_threshold: int = 5
 
+    # Recommendation approval gate
+    recommendation_trust_threshold: int = 5
+
     # SMTP (used by dashboard for MFA)
     smtp_email: str = ""
     smtp_app_password: str = ""

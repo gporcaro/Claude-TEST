@@ -174,6 +174,79 @@ def format_approval_blocks(article: dict) -> list[dict]:
     ]
 
 
+def format_recommendation_approval_blocks(
+    approval_id: int,
+    recommendations: list[dict],
+    original_text: str,
+    user_name: str,
+) -> list[dict]:
+    """Build Slack Block Kit blocks for a recommendation approval request in #it-helpdesk."""
+    rec_lines = "\n".join(
+        f"• `{r['canonical_form']}` ({r.get('category', 'general')})"
+        for r in recommendations
+    )
+    # Truncate preview to 500 chars
+    preview = original_text[:500]
+    if len(original_text) > 500:
+        preview += "..."
+
+    text = (
+        f":mag: *Recommendation approval needed*\n\n"
+        f"*User:* {user_name}\n\n"
+        f"*Recommendations requiring approval:*\n{rec_lines}\n\n"
+        f"*Response preview:*\n>>>{preview}"
+    )
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "action_id": "approve_recommendation",
+                    "value": str(approval_id),
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Deny"},
+                    "action_id": "deny_recommendation",
+                    "value": str(approval_id),
+                    "style": "danger",
+                },
+            ],
+        },
+    ]
+
+
+def redact_recommendations(text: str, recommendations: list[dict]) -> str:
+    """Remove recommendation text spans from the response and append a placeholder.
+
+    Each recommendation dict should have an ``original_text`` key with the
+    exact span to remove from the response.
+    """
+    redacted = text
+    for rec in recommendations:
+        span = rec.get("original_text", "")
+        if span and span in redacted:
+            redacted = redacted.replace(span, "")
+
+    # Clean up leftover blank lines
+    while "\n\n\n" in redacted:
+        redacted = redacted.replace("\n\n\n", "\n\n")
+    redacted = redacted.rstrip()
+
+    placeholder = (
+        "\n\n:hourglass_flowing_sand: _Specific troubleshooting steps are "
+        "pending IT review. You'll be notified once approved._"
+    )
+    return redacted + placeholder
+
+
 def _chunk_text(text: str, max_len: int) -> list[str]:
     """Split text into chunks respecting word boundaries."""
     if len(text) <= max_len:
