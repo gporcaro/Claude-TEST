@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # IT helpdesk channel for article approvals
     it_helpdesk_channel_id: str = ""
 
+    # Debug channel for bot reasoning traces
+    debug_channel_name: str = "servicedesk-bot-debug"
+
     # Public KB
     public_trust_threshold: int = 5
 

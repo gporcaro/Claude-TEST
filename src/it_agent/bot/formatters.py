@@ -247,6 +247,60 @@ def redact_recommendations(text: str, recommendations: list[dict]) -> str:
     return redacted + placeholder
 
 
+def format_debug_blocks(
+    source: str,
+    user_id: str,
+    user_message: str,
+    steps: list[str],
+    thread_link: str = "",
+    incident_channel_id: str = "",
+    ticket_id: str = "",
+) -> list[dict]:
+    """Build Block Kit blocks for a debug reasoning trace."""
+    source_emoji = {"dm": ":speech_balloon:", "incident": ":rotating_light:", "help-it": ":raising_hand:"}.get(source, ":mag:")
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{source_emoji} Debug: {source} interaction", "emoji": True},
+        },
+    ]
+
+    # Context line: user + links
+    ctx_parts = [f"User: <@{user_id}>"]
+    if thread_link:
+        ctx_parts.append(f"<{thread_link}|Original thread>")
+    if incident_channel_id:
+        ctx_parts.append(f"Incident: <#{incident_channel_id}>")
+    if ticket_id:
+        ctx_parts.append(f"Ticket: {ticket_id}")
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": " | ".join(ctx_parts)}],
+    })
+
+    # User message preview (300 chars, blockquoted)
+    preview = user_message[:300]
+    if len(user_message) > 300:
+        preview += "..."
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f">{preview}"},
+    })
+
+    blocks.append({"type": "divider"})
+
+    # Numbered reasoning steps (cap at 2900 chars for Slack block limit)
+    steps_text = "\n".join(steps)
+    if len(steps_text) > 2900:
+        steps_text = steps_text[:2900] + "\n_(truncated)_"
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": steps_text},
+    })
+
+    return blocks
+
+
 def _chunk_text(text: str, max_len: int) -> list[str]:
     """Split text into chunks respecting word boundaries."""
     if len(text) <= max_len:

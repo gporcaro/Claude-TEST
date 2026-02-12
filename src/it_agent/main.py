@@ -6,7 +6,7 @@ from qdrant_client import QdrantClient
 
 from it_agent.bot.app import create_app, start_app
 from it_agent.bot import events
-from it_agent.bot.handlers import discover_incident_channels, load_ai_context_articles, start_approval_timeout_loop, start_auto_close_loop, start_recommendation_timeout_loop
+from it_agent.bot.handlers import discover_incident_channels, load_ai_context_articles, resolve_debug_channel, start_approval_timeout_loop, start_auto_close_loop, start_recommendation_timeout_loop
 from it_agent.config import get_settings
 from it_agent.db import init_db
 from it_agent.kb.indexer import index_knowledge_base
@@ -30,6 +30,7 @@ async def _start(settings) -> None:
     await _ensure_kb_indexed(settings)
     await discover_incident_channels(settings)
     await load_ai_context_articles(settings)
+    await resolve_debug_channel(settings)
 
     from it_agent.bot.handlers import _incident_channels, _resolved_pending_close
     await events.emit("bot_startup", {

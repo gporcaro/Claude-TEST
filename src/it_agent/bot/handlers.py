@@ -16,6 +16,7 @@ from it_agent.agent.core import Agent, AgentResult
 from it_agent.bot.events import emit
 from it_agent.bot.formatters import (
     format_approval_blocks,
+    format_debug_blocks,
     format_error_blocks,
     format_public_article_blocks,
     format_recommendation_approval_blocks,
@@ -75,6 +76,9 @@ _AUTO_CLOSE_CHECK_INTERVAL = 60 * 60
 # [AI Context] KB articles loaded at startup: article_id → {id, title, content}
 _ai_context_articles: dict[str, dict] = {}
 
+# Debug channel ID resolved at startup (None = not found / disabled)
+_debug_channel_id: str | None = None
+
 
 async def load_ai_context_articles(settings: Settings) -> None:
     """Fetch KB articles prefixed with [AI Context] and cache them for agent use."""
@@ -97,6 +101,152 @@ async def load_ai_context_articles(settings: Settings) -> None:
             _ai_context_articles[article["id"]] = cleaned
 
     logger.info("Loaded %d AI context article(s)", len(_ai_context_articles))
+
+
+async def resolve_debug_channel(settings: Settings) -> None:
+    """Find the debug channel by name and cache its ID."""
+    global _debug_channel_id
+    if not settings.debug_channel_name:
+        logger.info("Debug channel name is empty — debug logging disabled")
+        return
+
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        cursor = None
+        while True:
+            kwargs: dict = {"types": "public_channel,private_channel", "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await client.conversations_list(**kwargs)
+            for ch in resp.get("channels", []):
+                if ch.get("name") == settings.debug_channel_name:
+                    _debug_channel_id = ch["id"]
+                    logger.info(
+                        "Debug channel resolved: #%s → %s",
+                        settings.debug_channel_name, _debug_channel_id,
+                    )
+                    return
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        logger.warning(
+            "Debug channel #%s not found — debug logging disabled",
+            settings.debug_channel_name,
+        )
+    except Exception:
+        logger.warning("Failed to resolve debug channel", exc_info=True)
+
+
+def _summarize_args(name: str, args: dict | None) -> str:
+    """One-liner summary of tool arguments (truncated)."""
+    if not args:
+        return ""
+    if name == "search_knowledge_base":
+        return args.get("query", "")[:80]
+    if name == "search_public_articles":
+        return args.get("query", "")[:80]
+    parts = ", ".join(f"{k}={v}" for k, v in args.items() if v is not None)
+    return parts[:120]
+
+
+def _summarize_result(name: str, res) -> str:
+    """One-liner summary of a tool result (truncated)."""
+    if res is None:
+        return "no result"
+    if isinstance(res, dict):
+        if name in ("search_knowledge_base", "search_public_articles"):
+            results = res.get("results", [])
+            return f"{len(results)} result(s)"
+        if res.get("success") is not None:
+            return "success" if res["success"] else "failed"
+        if res.get("error"):
+            return f"error: {str(res['error'])[:80]}"
+    text = str(res)
+    return text[:120] if len(text) > 120 else text
+
+
+async def _post_debug_summary(
+    source: str,
+    user_id: str,
+    user_message: str,
+    result: AgentResult,
+    channel: str,
+    thread_ts: str | None,
+    settings: Settings,
+    incident_channel_id: str = "",
+    ticket_id: str = "",
+) -> None:
+    """Post a structured reasoning trace to the debug channel (fire-and-forget)."""
+    if not _debug_channel_id:
+        return
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+
+        # Build thread permalink
+        thread_link = ""
+        if thread_ts:
+            try:
+                link_resp = await client.chat_getPermalink(channel=channel, message_ts=thread_ts)
+                thread_link = link_resp.get("permalink", "")
+            except Exception:
+                pass
+
+        # Build numbered steps
+        steps: list[str] = []
+        step = 1
+
+        # Step 1: AI Context articles
+        article_titles = [a["title"] for a in _ai_context_articles.values()]
+        # Simple keyword relevance: check if any words from the user message appear in article titles
+        relevant = []
+        msg_words = set(user_message.lower().split())
+        for title in article_titles:
+            title_words = set(title.lower().split())
+            if msg_words & title_words:
+                relevant.append(title.replace("[AI Context] ", ""))
+        relevance = f" — likely relevant: {', '.join(relevant)}" if relevant else ""
+        steps.append(f"#{step} [AI Context] {len(article_titles)} article(s) loaded{relevance}")
+        step += 1
+
+        # Steps for each tool call
+        for tc in result.tool_calls:
+            name = tc["name"]
+            args = tc.get("args")
+            res = tc.get("result")
+            if name in ("search_knowledge_base", "search_public_articles"):
+                query = _summarize_args(name, args)
+                hits = _summarize_result(name, res)
+                steps.append(f'#{step} :mag: KB search: "{query}" — {hits}')
+            else:
+                arg_str = _summarize_args(name, args)
+                res_str = _summarize_result(name, res)
+                emoji = ":white_check_mark:" if "success" in res_str else ":gear:"
+                steps.append(f"#{step} {emoji} {name}({arg_str}) → {res_str}")
+            step += 1
+
+        # Final step: response preview
+        preview = result.text[:200]
+        if len(result.text) > 200:
+            preview += "..."
+        steps.append(f"#{step} :speech_balloon: Response: {preview}")
+
+        blocks = format_debug_blocks(
+            source=source,
+            user_id=user_id,
+            user_message=user_message,
+            steps=steps,
+            thread_link=thread_link,
+            incident_channel_id=incident_channel_id,
+            ticket_id=ticket_id,
+        )
+
+        await client.chat_postMessage(
+            channel=_debug_channel_id,
+            text=f"Debug: {source} interaction from <@{user_id}>",
+            blocks=blocks,
+        )
+    except Exception:
+        logger.debug("Failed to post debug summary", exc_info=True)
 
 
 def _get_agent(settings: Settings) -> Agent:
@@ -1264,6 +1414,13 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
         await _register_incident_channels(result)
 
+        # Post debug reasoning trace (fire-and-forget)
+        asyncio.create_task(_post_debug_summary(
+            source="dm", user_id=user_id, user_message=text,
+            result=result, channel=channel, thread_ts=thread_ts,
+            settings=settings,
+        ))
+
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
         if iid is not None:
@@ -1500,6 +1657,22 @@ async def _handle_incident_message(
         history.append({"role": "assistant", "content": result.text})
 
         await _register_incident_channels(result)
+
+        # Post debug reasoning trace (fire-and-forget)
+        # Look up the original help-it thread for this incident channel
+        inc_ctx = _incident_context.get(channel, {})
+        inc_ticket_id = inc_ctx.get("ticket_id", "")
+        help_thread_ts = ""
+        if inc_ticket_id:
+            ht = _ticket_threads.get(inc_ticket_id)
+            if ht:
+                help_thread_ts = ht[1]
+        asyncio.create_task(_post_debug_summary(
+            source="incident", user_id=user_id, user_message=text,
+            result=result, channel=channel, thread_ts=help_thread_ts or None,
+            settings=settings, incident_channel_id=channel,
+            ticket_id=inc_ticket_id,
+        ))
 
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
@@ -1953,6 +2126,26 @@ async def _handle_help_channel_message(
         history.append({"role": "assistant", "content": result.text})
 
         await _register_incident_channels(result)
+
+        # Post debug reasoning trace (fire-and-forget)
+        # Reverse-look up ticket + incident channel for this help-it thread
+        help_ticket_id_dbg = ""
+        help_inc_channel_dbg = ""
+        for tid, (ch, ts) in _ticket_threads.items():
+            if ch == channel and ts == thread_ts:
+                help_ticket_id_dbg = tid
+                break
+        if help_ticket_id_dbg:
+            for ch_id, ctx in _incident_context.items():
+                if ctx.get("ticket_id") == help_ticket_id_dbg:
+                    help_inc_channel_dbg = ch_id
+                    break
+        asyncio.create_task(_post_debug_summary(
+            source="help-it", user_id=user_id, user_message=text,
+            result=result, channel=channel, thread_ts=thread_ts,
+            settings=settings, incident_channel_id=help_inc_channel_dbg,
+            ticket_id=help_ticket_id_dbg,
+        ))
 
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
