@@ -963,12 +963,12 @@ async def _update_incident_summary(
 
 
 async def _summarize_conversation(
-    history: list[dict], settings: Settings,
+    history: list[dict], settings: Settings, user_name: str = "the user",
 ) -> str:
     """Generate a concise summary of a #help-it conversation using Gemini."""
     lines: list[str] = []
     for msg in history:
-        role = "User" if msg["role"] == "user" else "IT Agent"
+        role = user_name if msg["role"] == "user" else "IT Agent"
         content = msg["content"]
         # Strip system context prefixes
         if content.startswith("[System"):
@@ -985,6 +985,7 @@ async def _summarize_conversation(
             model=settings.gemini_model,
             contents=(
                 "Summarize the following IT support conversation in 2-4 concise bullet points. "
+                f"Refer to the requester by their first name ({user_name}). "
                 "Focus on: the issue reported, key troubleshooting steps attempted, "
                 "and current status. Use Slack markdown (*bold*, `code`). Be brief.\n\n"
                 f"{conversation_text}"
@@ -1088,6 +1089,19 @@ async def _create_deferred_channel(
     assistant_count = sum(1 for m in history if m["role"] == "assistant")
     is_early = assistant_count <= 1
 
+    # Resolve the requester's first name for summaries
+    requester_first_name = "the user"
+    try:
+        name_uid = resolved_user_id if resolved_user_id != "unknown" else (user_id or "unknown")
+        if name_uid and name_uid != "unknown":
+            uinfo = await slack.users_info(user=name_uid)
+            profile = uinfo.get("user", {}).get("profile", {})
+            full = profile.get("first_name") or profile.get("real_name") or profile.get("display_name") or ""
+            if full:
+                requester_first_name = full.split()[0]
+    except Exception:
+        logger.debug("Could not resolve requester name for summary")
+
     sn_url = settings.sn_instance_url
 
     # ── Channel content based on reason + conversation stage ──
@@ -1124,7 +1138,7 @@ async def _create_deferred_channel(
                 break
     else:
         # Late button or escalation: generate summary and append to first message
-        summary = await _summarize_conversation(history, settings) if history else ""
+        summary = await _summarize_conversation(history, settings, requester_first_name) if history else ""
 
         if summary and summary_ts:
             # Build updated first message: ticket info + summary
