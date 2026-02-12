@@ -1106,7 +1106,21 @@ async def _handle_help_channel_message(
             _conversations[conv_key] = history
     else:
         history = _conversations[conv_key]
-        history.append({"role": "user", "content": text})
+        # Remind the agent about the existing ticket on follow-up messages
+        existing_ticket_id = None
+        for tid, (ch, ts) in _ticket_threads.items():
+            if ch == channel and ts == thread_ts:
+                existing_ticket_id = tid
+                break
+        if existing_ticket_id:
+            text_with_ctx = (
+                f"[System reminder: Ticket {existing_ticket_id} already exists for "
+                f"this thread. Do NOT offer to create a ticket or ask if the user "
+                f"wants one — it is already created.]\n\n{text}"
+            )
+            history.append({"role": "user", "content": text_with_ctx})
+        else:
+            history.append({"role": "user", "content": text})
 
     # Create interaction record on first message in this thread
     if conv_key not in _interaction_ids:
