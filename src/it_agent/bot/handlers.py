@@ -1653,7 +1653,7 @@ async def _handle_ticket_assigned(
                     await slack.chat_postMessage(
                         channel=t_info[0],
                         text=(
-                            f":bust_in_silhouette: Ticket {ticket_id} has been assigned to a human agent. "
+                            f":bust_in_silhouette: Ticket {ticket_id} has been assigned to a Support Agent. "
                             f"A private channel <#{channel_id}> has been created for further troubleshooting."
                         ),
                         thread_ts=t_info[1],
