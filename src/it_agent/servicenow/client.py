@@ -165,6 +165,8 @@ class ServiceNowClient:
             payload["comments"] = data["comment"]
         if "additional_assignee_list" in data:
             payload["additional_assignee_list"] = data["additional_assignee_list"]
+        if "description" in data:
+            payload["description"] = data["description"]
 
         # ServiceNow requires close_code + close_notes for resolved/closed
         if target_status in ("resolved", "closed"):

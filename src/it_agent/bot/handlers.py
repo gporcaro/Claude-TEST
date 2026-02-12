@@ -51,6 +51,14 @@ _pending_channels: dict[str, dict] = {}
 # Resolved tickets pending auto-close: ticket_id → resolved_epoch
 _resolved_pending_close: dict[str, float] = {}
 
+# Debounced live-summary timers: ticket_id → pending asyncio.Task
+_summary_timers: dict[str, asyncio.Task] = {}
+
+# Original descriptions saved at ticket creation: ticket_id → str
+_ticket_original_descriptions: dict[str, str] = {}
+
+_SUMMARY_DEBOUNCE_SECONDS = 5 * 60  # 5 minutes
+
 # Interaction tracking: (channel, thread_ts) → interaction_id in the DB
 _interaction_ids: dict[tuple[str, str], int] = {}
 
@@ -702,6 +710,11 @@ async def _register_incident_channels(result: AgentResult) -> None:
                 "original_text": None,  # will be built on first summary update
                 "summary_lines": [],
             }
+            # Save original description for live summary
+            if ticket_id:
+                _ticket_original_descriptions[ticket_id] = ticket.get(
+                    "_original_description", ticket.get("description", "")
+                )
             logger.info("Registered incident channel %s", channel_id)
             await emit("ticket_created", {
                 "ticket_id": ticket_id,
@@ -789,6 +802,84 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
             "Something went wrong processing your request. Please try again."
         )
         await say(text="Error processing request", blocks=blocks, thread_ts=thread_ts)
+
+
+def _collect_ticket_history(ticket_id: str) -> list[dict]:
+    """Collect conversation history from both the #help-it thread and the
+    incident channel for a given ticket."""
+    messages: list[dict] = []
+
+    # Thread history
+    thread_info = _ticket_threads.get(ticket_id)
+    if thread_info:
+        thread_conv = _conversations.get(thread_info, [])
+        messages.extend(thread_conv)
+
+    # Incident channel history
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            ch_conv = _conversations.get((ch_id, "incident"), [])
+            messages.extend(ch_conv)
+            break
+
+    return messages
+
+
+def _schedule_live_summary(ticket_id: str, settings: Settings) -> None:
+    """(Re)schedule a live-summary push to ServiceNow after 5 min of inactivity."""
+    existing = _summary_timers.pop(ticket_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+
+    async def _delayed():
+        await asyncio.sleep(_SUMMARY_DEBOUNCE_SECONDS)
+        await _push_live_summary(ticket_id, settings)
+        _summary_timers.pop(ticket_id, None)
+
+    _summary_timers[ticket_id] = asyncio.create_task(_delayed())
+
+
+async def _push_live_summary(ticket_id: str, settings: Settings) -> None:
+    """Generate an AI summary of all conversations for this ticket and
+    write it into the ServiceNow description field."""
+    # 1. Collect conversation history from both thread and channel
+    history = _collect_ticket_history(ticket_id)
+    if not history:
+        return
+
+    # 2. Generate summary via Gemini
+    summary = await _summarize_conversation(history, settings)
+
+    # 3. Build updated description: original + separator + summary
+    original = _ticket_original_descriptions.get(ticket_id, "")
+    if not original:
+        # Fetch from SN as fallback
+        sn = ServiceNowClient(settings.sn_instance_url, settings.sn_username, settings.sn_password)
+        try:
+            incident = await sn.get_incident(ticket_id)
+            if incident:
+                desc = incident.get("description", "")
+                # Strip any previous live summary
+                original = desc.split("\n---------------------------------------------------\n")[0].rstrip()
+        finally:
+            await sn.close()
+
+    separator = "\n\n---------------------------------------------------\n\n"
+    new_description = f"{original}{separator}**Live Summary (auto-updated):**\n{summary}"
+
+    # 4. Update ServiceNow
+    sn = ServiceNowClient(settings.sn_instance_url, settings.sn_username, settings.sn_password)
+    try:
+        incident = await sn.get_incident(ticket_id)
+        if incident:
+            await sn.update_incident(
+                incident["sys_id"],
+                {"description": new_description},
+                current_state=incident.get("_raw_state", "1"),
+            )
+            logger.info("Pushed live summary to SN for %s", ticket_id)
+    finally:
+        await sn.close()
 
 
 async def _handle_incident_message(
@@ -929,6 +1020,12 @@ async def _handle_incident_message(
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
+
+        # Schedule debounced live summary push to ServiceNow
+        ctx = _incident_context.get(channel, {})
+        inc_ticket_id = ctx.get("ticket_id")
+        if inc_ticket_id:
+            _schedule_live_summary(inc_ticket_id, settings)
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, None, settings)
@@ -1251,6 +1348,7 @@ async def _handle_help_channel_message(
 
                 if ticket_id:
                     _ticket_threads[ticket_id] = (channel, thread_ts)
+                    _ticket_original_descriptions[ticket_id] = text
                     # Store for deferred channel creation
                     _pending_channels[ticket_id] = {
                         "user_id": user_id,
@@ -1532,6 +1630,15 @@ async def _handle_help_channel_message(
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
+
+        # Schedule debounced live summary push to ServiceNow
+        help_ticket_id: str | None = None
+        for tid, (ch, ts) in _ticket_threads.items():
+            if ch == channel and ts == thread_ts:
+                help_ticket_id = tid
+                break
+        if help_ticket_id:
+            _schedule_live_summary(help_ticket_id, settings)
 
     except Exception as exc:
         logger.exception("Error processing #help-it message")

@@ -173,6 +173,8 @@ async def create_ticket(
     finally:
         await client.close()
 
+    incident["_original_description"] = description
+
     result: dict = {"success": True, "ticket": incident}
 
     # Optionally create a private Slack channel for the incident.
