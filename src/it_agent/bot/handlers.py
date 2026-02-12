@@ -1180,6 +1180,10 @@ _BASIC_RECOMMENDATIONS = {
     "boot safe mode", "safe mode", "boot into safe mode",
     "hold power button", "press and hold power",
     "reset battery", "recalibrate battery",
+    # Software updates
+    "install updates", "install pending updates", "check for updates",
+    "software update", "update macos", "update windows", "update os",
+    "install macos update", "install windows update",
     # Windows hardware troubleshooting
     "run sfc", "system file checker", "check disk",
     "boot safe mode windows", "safe mode with networking",
@@ -1731,17 +1735,12 @@ async def _handle_incident_message(
         if iid is not None:
             await _record_agent_result(iid, text, result)
 
-        # Recommendation approval gate
-        user_display = await _resolve_user_name(user_id, settings)
-        final_text, gated_msg_ts = await _gate_recommendations(
-            result.text, channel, None, say, settings,
-            interaction_id=iid, user_name=user_display,
-        )
-        if gated_msg_ts is None:
-            sn_url = settings.sn_instance_url
-            linked_text = linkify_servicenow_refs(result.text, sn_url)
-            blocks = format_response_blocks(result.text, sn_url)
-            await say(text=linked_text, blocks=blocks)
+        # Incident channels are dedicated troubleshooting spaces with IT
+        # involvement — skip recommendation gating and post directly.
+        sn_url = settings.sn_instance_url
+        linked_text = linkify_servicenow_refs(result.text, sn_url)
+        blocks = format_response_blocks(result.text, sn_url)
+        await say(text=linked_text, blocks=blocks)
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
