@@ -44,7 +44,7 @@ _incident_channels: set[str] = set()
 # Per-incident-channel context: channel_id → {ticket_id, title, description, ...}
 _incident_context: dict[str, dict] = {}
 
-# Pending channel creation: ticket_id → {user_id, ticket, kb_results, thread_ts, channel}
+# Pending channel creation: ticket_id → {user_id, ticket, thread_ts, channel}
 _pending_channels: dict[str, dict] = {}
 
 # Resolved tickets pending auto-close: ticket_id → resolved_epoch
@@ -993,10 +993,6 @@ async def _create_deferred_channel(
         except Exception:
             logger.debug("Failed to post permalink in deferred channel %s", channel_id, exc_info=True)
 
-    # Post any stored KB results
-    if pending and pending.get("kb_results"):
-        await _post_kb_results_to_channel(channel_id, pending["kb_results"], settings)
-
     # Replicate the last agent response into the channel
     if pending and pending.get("thread_ts") and pending.get("channel"):
         conv_key = (pending["channel"], pending["thread_ts"])
@@ -1063,7 +1059,6 @@ async def _handle_help_channel_message(
                     _pending_channels[ticket_id] = {
                         "user_id": user_id,
                         "ticket": ticket,
-                        "kb_results": [],
                         "thread_ts": thread_ts,
                         "channel": channel,
                     }
@@ -1230,12 +1225,6 @@ async def _handle_help_channel_message(
                 "article_ids": [a.get("id", "") for a in kb_results],
             })
 
-        # Store KB results in pending for deferred channel posting
-        if auto_ticket_info and kb_results:
-            ticket_id = auto_ticket_info.get("ticket", {}).get("ticket_id", "")
-            if ticket_id and ticket_id in _pending_channels:
-                _pending_channels[ticket_id]["kb_results"] = kb_results
-
         # Handle any additional tickets the agent may have created (shouldn't happen
         # but keep as safety net)
         for tc in result.tool_calls:
@@ -1318,44 +1307,6 @@ async def _post_public_article_followups(
             "result_count": len(articles),
             "pending_count": len(pending),
         })
-
-
-async def _post_kb_results_to_channel(
-    channel_id: str, kb_results: list[dict], settings: Settings,
-) -> None:
-    """Post KB article references and content in the incident channel."""
-    sn_url = settings.sn_instance_url
-    client = AsyncWebClient(token=settings.slack_bot_token)
-
-    for article in kb_results:
-        article_id = article.get("id", "")
-        title = article.get("title", "Untitled")
-        content = article.get("content", "")
-        source = article.get("source", "")
-
-        # Skip internal articles — they can inform the agent but shouldn't
-        # be shared directly with users.
-        if content.strip().upper().startswith("INTERNAL"):
-            continue
-
-        # Build the message
-        if article_id.startswith("KB"):
-            header = f":book: *{article_id} — {title}*"
-        elif source == "local":
-            header = f":book: *{title}*"
-        else:
-            header = f":book: *{article_id} — {title}*"
-
-        message = f"{header}\n\n{content}"
-        message = linkify_servicenow_refs(message, sn_url)
-
-        try:
-            await client.chat_postMessage(channel=channel_id, text=message)
-        except Exception:
-            logger.warning(
-                "Failed to post KB article %s to channel %s", article_id, channel_id,
-                exc_info=True,
-            )
 
 
 async def post_resolution_update(
