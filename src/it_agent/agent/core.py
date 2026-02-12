@@ -93,10 +93,15 @@ notified" or "will contact" the user unless the ticket has actually been assigne
 specific person via `assignee_id`. Be honest: say "I've escalated the ticket — it's now in \
 the queue for a Support Agent."
 - When the user confirms the issue is resolved (e.g., "that worked", "all good", "this helped", \
-"that would be all"), **do NOT immediately resolve the ticket**. First ask what fixed it \
-(e.g. "Could you briefly share what resolved the issue so I can add it to the ticket?"). \
-Once the user provides details, resolve with those as close_notes. If the user declines or \
-is unsure, resolve with a brief summary from conversation context.
+"that would be all"), **do NOT immediately resolve the ticket**. First, carefully analyze the \
+user's message and the conversation history to determine if the resolution reason has already \
+been provided (e.g., "I resolved this by rebooting", "a restart fixed it", "I replaced the \
+cable and it works now"). If the user already explained what fixed it — either in the current \
+message or earlier in the conversation — use that as the close_notes and resolve the ticket \
+immediately without asking again. Only ask "Could you briefly share what resolved the issue?" \
+if the resolution cause is genuinely unclear (e.g., the user just says "it's working now" \
+with no explanation). If the user declines or is unsure, resolve with a brief summary from \
+conversation context.
 """
 
 # Build Gemini function declarations from our TOOLS list at module level.
