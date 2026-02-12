@@ -1239,6 +1239,42 @@ async def _handle_help_channel_message(
                 "article_ids": [a.get("id", "") for a in kb_results],
             })
 
+        # ── Auto-create channel on escalation (priority bump or assignment) ──
+        for tc in result.tool_calls:
+            if tc["name"] != "update_ticket":
+                continue
+            args = tc.get("args", {})
+            escalated = args.get("priority") in ("high", "urgent") or args.get("assignee_id")
+            if not escalated:
+                continue
+            tc_ticket_id = args.get("ticket_id", "")
+            if not tc_ticket_id:
+                continue
+            # Check if channel already exists for this ticket
+            already_has_channel = any(
+                ctx.get("ticket_id") == tc_ticket_id for ctx in _incident_context.values()
+            )
+            if already_has_channel:
+                continue
+            # Create the channel
+            if tc_ticket_id in _pending_channels or tc_ticket_id in _ticket_threads:
+                logger.info("Escalation detected: auto-creating channel for %s", tc_ticket_id)
+                ch_result = await _create_deferred_channel(tc_ticket_id, settings)
+                if ch_result:
+                    ch_id = ch_result["channel_id"]
+                    try:
+                        slack = AsyncWebClient(token=settings.slack_bot_token)
+                        await slack.chat_postMessage(
+                            channel=channel,
+                            text=(
+                                f":rotating_light: Ticket {tc_ticket_id} has been escalated. "
+                                f"A private channel <#{ch_id}> has been created for further troubleshooting."
+                            ),
+                            thread_ts=thread_ts,
+                        )
+                    except Exception:
+                        logger.debug("Failed to post escalation channel notice", exc_info=True)
+
         # Handle any additional tickets the agent may have created (shouldn't happen
         # but keep as safety net)
         for tc in result.tool_calls:
