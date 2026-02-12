@@ -820,6 +820,100 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to post channel created thread message", exc_info=True)
 
+    # --- Archive channel now action ---
+
+    @app.action("archive_channel_now")
+    async def handle_archive_channel_now(ack, body) -> None:
+        await ack()
+        ticket_id = body["actions"][0]["value"]
+        channel = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        button_user_id = body["user"]["id"]
+
+        client = AsyncWebClient(token=settings.slack_bot_token)
+
+        # Update button message to show processing
+        try:
+            await client.chat_update(
+                channel=channel,
+                ts=message_ts,
+                text=f":hourglass_flowing_sand: Archiving channel for {ticket_id}...",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":hourglass_flowing_sand: Archiving channel for {ticket_id}...",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update archive button message", exc_info=True)
+
+        # 1. Close ticket in ServiceNow
+        sn_client = ServiceNowClient(
+            settings.sn_instance_url, settings.sn_username, settings.sn_password
+        )
+        try:
+            incident = await sn_client.get_incident(ticket_id)
+            if incident and incident.get("status") in ("resolved",):
+                # Resolve Slack user display name for close notes
+                try:
+                    user_info = await client.users_info(user=button_user_id)
+                    user_name = user_info["user"].get("real_name") or user_info["user"].get("name", button_user_id)
+                except Exception:
+                    user_name = button_user_id
+                await sn_client.update_incident(
+                    incident["sys_id"],
+                    {
+                        "status": "closed",
+                        "close_notes": f"Manually archived by {user_name} via Slack.",
+                    },
+                    current_state=incident.get("_raw_state", "6"),
+                )
+                logger.info("Closed ticket %s in ServiceNow (manual archive by %s)", ticket_id, button_user_id)
+        except Exception:
+            logger.warning("Archive now: failed to close %s in ServiceNow", ticket_id, exc_info=True)
+        finally:
+            await sn_client.close()
+
+        # 2. Post farewell note
+        sn_url = settings.sn_instance_url
+        note = (
+            f":lock: *This channel is now being archived.*\n\n"
+            f"Ticket {ticket_id} was manually closed by <@{button_user_id}>. "
+            f"If you need further assistance on this issue, "
+            f"please open a new request in #help-it."
+        )
+        note = linkify_servicenow_refs(note, sn_url)
+        try:
+            await client.chat_postMessage(channel=channel, text=note)
+        except Exception:
+            logger.warning("Archive now: failed to post farewell note in %s", channel, exc_info=True)
+
+        # 3. Archive the channel
+        try:
+            await client.conversations_archive(channel=channel)
+            logger.info("Archived incident channel %s for ticket %s (manual)", channel, ticket_id)
+        except Exception:
+            logger.warning("Archive now: failed to archive channel %s", channel, exc_info=True)
+
+        # 4. Update interaction record
+        try:
+            interaction = await db.get_interaction_by_ticket(ticket_id)
+            if interaction:
+                await db.update_interaction(interaction["id"], status="closed")
+        except Exception:
+            logger.debug("Failed to update interaction on manual archive for %s", ticket_id, exc_info=True)
+
+        # 5. Clean up tracking dicts
+        _resolved_pending_close.pop(ticket_id, None)
+        _incident_channels.discard(channel)
+        _incident_context.pop(channel, None)
+
+        # 6. Emit events
+        await emit("ticket_auto_closed", {"ticket_id": ticket_id, "channel_id": channel})
+        await emit("channel_archived", {"ticket_id": ticket_id, "channel_id": channel})
+
 
 async def _register_incident_channels(result: AgentResult) -> None:
     """Track any incident channels created during this agent run."""
@@ -2134,6 +2228,46 @@ async def post_resolution_update(
     _resolved_pending_close[ticket_id] = time.time()
     logger.info("Ticket %s queued for auto-close in 48h", ticket_id)
 
+    # Post resolution notice with "Archive Now" button in the incident channel
+    channel_id: str | None = None
+    for ch_id, ctx in _incident_context.items():
+        if ctx.get("ticket_id") == ticket_id:
+            channel_id = ch_id
+            break
+
+    if channel_id is not None:
+        notice = (
+            f":white_check_mark: *Ticket {ticket_id} has been resolved.*\n\n"
+            f"This channel will be automatically archived in 48 hours. "
+            f"If you'd like to archive it sooner, click the button below."
+        )
+        notice = linkify_servicenow_refs(notice, settings.sn_instance_url)
+        try:
+            await client.chat_postMessage(
+                channel=channel_id,
+                text=notice,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": notice},
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Archive Now"},
+                                "style": "danger",
+                                "action_id": "archive_channel_now",
+                                "value": ticket_id,
+                            }
+                        ],
+                    },
+                ],
+            )
+        except Exception:
+            logger.debug("Failed to post resolution notice in %s", channel_id, exc_info=True)
+
 
 async def _handle_ticket_assigned(
     ticket_id: str, assignee_sn_sys_id: str, settings: Settings
@@ -2265,11 +2399,11 @@ async def _rename_incident_channel_resolved(
 async def start_auto_close_loop(settings: Settings) -> None:
     """Background loop that closes resolved tickets after 48 hours and archives their channels."""
     while True:
-        await asyncio.sleep(_AUTO_CLOSE_CHECK_INTERVAL)
         try:
             await _process_pending_auto_closes(settings)
         except Exception:
             logger.warning("Auto-close loop iteration failed", exc_info=True)
+        await asyncio.sleep(_AUTO_CLOSE_CHECK_INTERVAL)
 
 
 async def _process_pending_auto_closes(settings: Settings) -> None:
