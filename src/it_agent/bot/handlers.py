@@ -6,6 +6,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+from google import genai
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -550,6 +551,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         channel = body["channel"]["id"]
         message_ts = body["message"]["ts"]
         thread_ts = body["message"].get("thread_ts") or message_ts
+        button_user_id = body["user"]["id"]
 
         client = AsyncWebClient(token=settings.slack_bot_token)
 
@@ -575,7 +577,12 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 return
 
         # Create the channel
-        result = await _create_deferred_channel(ticket_id, settings)
+        result = await _create_deferred_channel(
+            ticket_id, settings,
+            thread_info=(channel, thread_ts),
+            user_id=button_user_id,
+            reason="button",
+        )
         if result is None:
             try:
                 await client.chat_postMessage(
@@ -926,19 +933,70 @@ async def _update_incident_summary(
         logger.warning("Failed to update incident summary in %s", channel, exc_info=True)
 
 
+async def _summarize_conversation(
+    history: list[dict], settings: Settings,
+) -> str:
+    """Generate a concise summary of a #help-it conversation using Gemini."""
+    lines: list[str] = []
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "IT Agent"
+        content = msg["content"]
+        # Strip system context prefixes
+        if content.startswith("[System"):
+            content = content.split("]\n\n", 1)[-1] if "]\n\n" in content else content
+        if content.startswith("[System reminder"):
+            content = content.split("]\n\n", 1)[-1] if "]\n\n" in content else content
+        lines.append(f"{role}: {content}")
+
+    conversation_text = "\n\n".join(lines)
+
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=(
+                "Summarize the following IT support conversation in 2-4 concise bullet points. "
+                "Focus on: the issue reported, key troubleshooting steps attempted, "
+                "and current status. Use Slack markdown (*bold*, `code`). Be brief.\n\n"
+                f"{conversation_text}"
+            ),
+        )
+        return response.text or "No summary available."
+    except Exception:
+        logger.warning("Failed to generate conversation summary", exc_info=True)
+        # Fallback: first user message truncated
+        for msg in history:
+            if msg["role"] == "user":
+                content = msg["content"]
+                if content.startswith("[System"):
+                    content = content.split("]\n\n", 1)[-1] if "]\n\n" in content else content
+                return content[:300]
+        return "No summary available."
+
+
 async def _create_deferred_channel(
-    ticket_id: str, settings: Settings,
+    ticket_id: str,
+    settings: Settings,
+    *,
+    thread_info: tuple[str, str] | None = None,
+    user_id: str | None = None,
+    reason: str = "button",
 ) -> dict | None:
     """Create a deferred incident channel for a ticket.
 
     Uses ``_pending_channels`` when available; falls back to fetching the
     ticket from ServiceNow (handles bot restarts).
 
+    Args:
+        thread_info: (channel, thread_ts) override when _ticket_threads is empty.
+        user_id: Fallback Slack user ID when _pending_channels is empty.
+        reason: ``"button"`` or ``"escalation"`` — controls channel content.
+
     Returns ``{channel_id, channel_name}`` on success or ``None`` on failure.
     """
     pending = _pending_channels.get(ticket_id)
     if pending:
-        user_id = pending["user_id"]
+        resolved_user_id = pending["user_id"]
         ticket = pending["ticket"]
     else:
         # Fallback: fetch from ServiceNow (bot may have restarted)
@@ -948,14 +1006,15 @@ async def _create_deferred_channel(
             logger.warning("Could not fetch ticket %s from ServiceNow: %s", ticket_id, sn_result["error"])
             return None
         ticket = sn_result["ticket"]
-        user_id = "unknown"
+        resolved_user_id = user_id or "unknown"
 
-    ch = await create_incident_channel(ticket, settings, user_id)
+    ch = await create_incident_channel(ticket, settings, resolved_user_id)
     if not ch:
         return None
 
     channel_id = ch["channel_id"]
     channel_name = ch["channel_name"]
+    summary_ts = ch.get("summary_ts")
 
     # Register in global tracking
     _incident_channels.add(channel_id)
@@ -964,7 +1023,7 @@ async def _create_deferred_channel(
         "title": ticket.get("title", ""),
         "description": ticket.get("description", ""),
         "priority": ticket.get("priority", "medium"),
-        "summary_ts": ch.get("summary_ts"),
+        "summary_ts": summary_ts,
         "original_text": None,
         "summary_lines": [],
     }
@@ -976,32 +1035,54 @@ async def _create_deferred_channel(
 
     slack = AsyncWebClient(token=settings.slack_bot_token)
 
-    # Post permalink to the original #help-it thread (if we have it)
-    thread_info = _ticket_threads.get(ticket_id)
-    if thread_info:
-        help_channel, thread_ts = thread_info
-        try:
-            plink = await slack.chat_getPermalink(
-                channel=help_channel, message_ts=thread_ts,
-            )
-            permalink = plink.get("permalink", "")
-            if permalink:
-                await slack.chat_postMessage(
-                    channel=channel_id,
-                    text=f":link: <{permalink}|Original #help-it thread>",
-                )
-        except Exception:
-            logger.debug("Failed to post permalink in deferred channel %s", channel_id, exc_info=True)
+    # Resolve thread info for permalink
+    resolved_thread = thread_info or _ticket_threads.get(ticket_id)
+    if resolved_thread:
+        help_channel, help_thread_ts = resolved_thread
+    else:
+        help_channel, help_thread_ts = None, None
 
-    # Replicate the last agent response into the channel
+    # Recover conversation history
+    history: list[dict] = []
     if pending and pending.get("thread_ts") and pending.get("channel"):
         conv_key = (pending["channel"], pending["thread_ts"])
         history = _conversations.get(conv_key, [])
-        # Find last assistant message
-        for msg in reversed(history):
+    elif help_channel and help_thread_ts:
+        conv_key = (help_channel, help_thread_ts)
+        history = _conversations.get(conv_key, [])
+        if not history:
+            history = await _recover_thread_history(
+                help_channel, help_thread_ts, settings,
+            )
+
+    # Count real exchanges (exclude system-only messages)
+    assistant_count = sum(1 for m in history if m["role"] == "assistant")
+    is_early = assistant_count <= 1
+
+    sn_url = settings.sn_instance_url
+
+    # ── Channel content based on reason + conversation stage ──
+    if reason == "button" and is_early:
+        # Early button press: post the first bot response in the channel
+        # Post permalink first
+        if help_channel and help_thread_ts:
+            try:
+                plink = await slack.chat_getPermalink(
+                    channel=help_channel, message_ts=help_thread_ts,
+                )
+                permalink = plink.get("permalink", "")
+                if permalink:
+                    await slack.chat_postMessage(
+                        channel=channel_id,
+                        text=f":link: <{permalink}|Original #help-it thread>",
+                    )
+            except Exception:
+                logger.debug("Failed to post permalink in channel %s", channel_id, exc_info=True)
+
+        # Find first assistant response and post it
+        for msg in history:
             if msg["role"] == "assistant":
                 try:
-                    sn_url = settings.sn_instance_url
                     ch_text = _strip_channel_created_lines(msg["content"], channel_name)
                     if ch_text.strip():
                         ch_linked = linkify_servicenow_refs(ch_text, sn_url)
@@ -1010,13 +1091,58 @@ async def _create_deferred_channel(
                             channel=channel_id, text=ch_linked, blocks=ch_blocks,
                         )
                 except Exception:
-                    logger.debug("Failed to replicate agent response in deferred channel", exc_info=True)
+                    logger.debug("Failed to post first response in channel", exc_info=True)
                 break
+    else:
+        # Late button or escalation: generate summary and append to first message
+        summary = await _summarize_conversation(history, settings) if history else ""
+
+        if summary and summary_ts:
+            # Build updated first message: ticket info + summary
+            sn_link = (
+                f"{sn_url}/incident.do"
+                f"?sysparm_query=number={ticket.get('ticket_id', ticket_id)}"
+            )
+            updated_text = (
+                f"*Incident {ticket.get('ticket_id', ticket_id)}*\n"
+                f"*Title:* {ticket.get('title', '')}\n"
+                f"*Priority:* {ticket.get('priority', '')}\n"
+                f"*Description:* {ticket.get('description', '')}\n\n"
+                f"<{sn_link}|View in ServiceNow>\n\n"
+                f"*Conversation Summary:*\n{summary}"
+            )
+            try:
+                await slack.chat_update(
+                    channel=channel_id, ts=summary_ts, text=updated_text,
+                )
+            except Exception:
+                logger.debug("Failed to update first message with summary", exc_info=True)
+        elif summary:
+            # summary_ts unavailable — post summary as a separate message
+            await slack.chat_postMessage(
+                channel=channel_id,
+                text=f"*Conversation Summary:*\n{summary}",
+            )
+
+        # Post permalink
+        if help_channel and help_thread_ts:
+            try:
+                plink = await slack.chat_getPermalink(
+                    channel=help_channel, message_ts=help_thread_ts,
+                )
+                permalink = plink.get("permalink", "")
+                if permalink:
+                    await slack.chat_postMessage(
+                        channel=channel_id,
+                        text=f":link: <{permalink}|Original #help-it thread>",
+                    )
+            except Exception:
+                logger.debug("Failed to post permalink in channel %s", channel_id, exc_info=True)
 
     # Clean up pending entry
     _pending_channels.pop(ticket_id, None)
 
-    logger.info("Deferred channel %s created for ticket %s", channel_name, ticket_id)
+    logger.info("Deferred channel %s created for ticket %s (reason=%s, early=%s)", channel_name, ticket_id, reason, is_early)
     return {"channel_id": channel_id, "channel_name": channel_name}
 
 
@@ -1256,24 +1382,27 @@ async def _handle_help_channel_message(
             )
             if already_has_channel:
                 continue
-            # Create the channel
-            if tc_ticket_id in _pending_channels or tc_ticket_id in _ticket_threads:
-                logger.info("Escalation detected: auto-creating channel for %s", tc_ticket_id)
-                ch_result = await _create_deferred_channel(tc_ticket_id, settings)
-                if ch_result:
-                    ch_id = ch_result["channel_id"]
-                    try:
-                        slack = AsyncWebClient(token=settings.slack_bot_token)
-                        await slack.chat_postMessage(
-                            channel=channel,
-                            text=(
-                                f":rotating_light: Ticket {tc_ticket_id} has been escalated. "
-                                f"A private channel <#{ch_id}> has been created for further troubleshooting."
-                            ),
-                            thread_ts=thread_ts,
-                        )
-                    except Exception:
-                        logger.debug("Failed to post escalation channel notice", exc_info=True)
+            logger.info("Escalation detected: auto-creating channel for %s", tc_ticket_id)
+            ch_result = await _create_deferred_channel(
+                tc_ticket_id, settings,
+                thread_info=(channel, thread_ts),
+                user_id=user_id,
+                reason="escalation",
+            )
+            if ch_result:
+                ch_id = ch_result["channel_id"]
+                try:
+                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    await slack.chat_postMessage(
+                        channel=channel,
+                        text=(
+                            f":rotating_light: Ticket {tc_ticket_id} has been escalated. "
+                            f"A private channel <#{ch_id}> has been created for further troubleshooting."
+                        ),
+                        thread_ts=thread_ts,
+                    )
+                except Exception:
+                    logger.debug("Failed to post escalation channel notice", exc_info=True)
 
         # Handle any additional tickets the agent may have created (shouldn't happen
         # but keep as safety net)
@@ -1422,24 +1551,28 @@ async def _handle_ticket_assigned(
             channel_id = ch_id
             break
 
-    # Auto-create channel if ticket is pending (deferred flow / escalation)
-    if channel_id is None and (ticket_id in _pending_channels or ticket_id in _ticket_threads):
-        logger.info("Escalation: auto-creating channel for ticket %s", ticket_id)
-        ch_result = await _create_deferred_channel(ticket_id, settings)
+    # Auto-create channel if none exists yet (deferred flow / escalation)
+    if channel_id is None:
+        logger.info("Assignment: auto-creating channel for ticket %s", ticket_id)
+        t_info = _ticket_threads.get(ticket_id)
+        ch_result = await _create_deferred_channel(
+            ticket_id, settings,
+            thread_info=t_info,
+            reason="escalation",
+        )
         if ch_result:
             channel_id = ch_result["channel_id"]
             # Notify the #help-it thread about escalation
-            thread_info = _ticket_threads.get(ticket_id)
-            if thread_info:
+            if t_info:
                 try:
                     slack = AsyncWebClient(token=settings.slack_bot_token)
                     await slack.chat_postMessage(
-                        channel=thread_info[0],
+                        channel=t_info[0],
                         text=(
                             f":bust_in_silhouette: Ticket {ticket_id} has been assigned to a human agent. "
                             f"A private channel <#{channel_id}> has been created for further troubleshooting."
                         ),
-                        thread_ts=thread_info[1],
+                        thread_ts=t_info[1],
                     )
                 except Exception:
                     logger.debug("Failed to post escalation notice in #help-it thread", exc_info=True)

@@ -26,8 +26,13 @@ async def create_incident_channel(
         slack = AsyncWebClient(token=_settings.slack_bot_token)
 
         # Look up user's display name for channel naming
-        user_info = await slack.users_info(user=_user_id)
-        username = user_info["user"]["name"]
+        username = "support"
+        if _user_id and _user_id != "unknown":
+            try:
+                user_info = await slack.users_info(user=_user_id)
+                username = user_info["user"]["name"]
+            except Exception:
+                logger.debug("Could not resolve user %s for channel naming", _user_id)
 
         # Slack channel names: lowercase, no spaces, max 80 chars
         inc_number = incident["ticket_id"].lower()
@@ -40,16 +45,17 @@ async def create_incident_channel(
 
         # Invite the requester to the channel (isolated so a failure here
         # does not prevent the summary message from being posted).
-        try:
-            await slack.conversations_invite(channel=channel_id, users=_user_id)
-        except Exception as exc:
-            if "already_in_channel" in str(exc):
-                logger.debug("Requester %s already in channel %s", _user_id, channel_id)
-            else:
-                logger.warning(
-                    "Failed to invite requester %s to channel %s: %s",
-                    _user_id, channel_id, exc,
-                )
+        if _user_id and _user_id != "unknown":
+            try:
+                await slack.conversations_invite(channel=channel_id, users=_user_id)
+            except Exception as exc:
+                if "already_in_channel" in str(exc):
+                    logger.debug("Requester %s already in channel %s", _user_id, channel_id)
+                else:
+                    logger.warning(
+                        "Failed to invite requester %s to channel %s: %s",
+                        _user_id, channel_id, exc,
+                    )
 
         # Post initial message with incident summary + ServiceNow link
         sn_link = (
