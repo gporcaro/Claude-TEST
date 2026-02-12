@@ -12,11 +12,79 @@ from it_agent.servicenow.client import _PRIORITY_TO_URGENCY, _STATUS_TO_STATE, S
 logger = logging.getLogger(__name__)
 
 
+async def create_incident_channel(
+    incident: dict,
+    _settings: Settings,
+    _user_id: str,
+) -> dict:
+    """Create a private Slack channel for an incident and post the summary.
+
+    Returns ``{channel_name, channel_id, summary_ts}`` on success, or ``{}``
+    on failure.
+    """
+    try:
+        slack = AsyncWebClient(token=_settings.slack_bot_token)
+
+        # Look up user's display name for channel naming
+        user_info = await slack.users_info(user=_user_id)
+        username = user_info["user"]["name"]
+
+        # Slack channel names: lowercase, no spaces, max 80 chars
+        inc_number = incident["ticket_id"].lower()
+        channel_name = f"{inc_number}-{username}"[:80]
+
+        channel_resp = await slack.conversations_create(
+            name=channel_name, is_private=True
+        )
+        channel_id = channel_resp["channel"]["id"]
+
+        # Invite the requester to the channel (isolated so a failure here
+        # does not prevent the summary message from being posted).
+        try:
+            await slack.conversations_invite(channel=channel_id, users=_user_id)
+        except Exception as exc:
+            if "already_in_channel" in str(exc):
+                logger.debug("Requester %s already in channel %s", _user_id, channel_id)
+            else:
+                logger.warning(
+                    "Failed to invite requester %s to channel %s: %s",
+                    _user_id, channel_id, exc,
+                )
+
+        # Post initial message with incident summary + ServiceNow link
+        sn_link = (
+            f"{_settings.sn_instance_url}/incident.do"
+            f"?sysparm_query=number={incident['ticket_id']}"
+        )
+        message = (
+            f"*Incident {incident['ticket_id']}*\n"
+            f"*Title:* {incident['title']}\n"
+            f"*Priority:* {incident['priority']}\n"
+            f"*Description:* {incident['description']}\n\n"
+            f"<{sn_link}|View in ServiceNow>"
+        )
+        msg_resp = await slack.chat_postMessage(channel=channel_id, text=message)
+
+        return {
+            "channel_name": channel_name,
+            "channel_id": channel_id,
+            "summary_ts": msg_resp["ts"],
+        }
+    except Exception:
+        logger.warning(
+            "Failed to create Slack channel for %s",
+            incident.get("ticket_id", "unknown"),
+            exc_info=True,
+        )
+        return {}
+
+
 async def create_ticket(
     title: str,
     description: str,
     priority: str = "medium",
     category: str = "",
+    create_channel: bool = True,
     _settings: Settings | None = None,
     _user_id: str = "unknown",
     **_,
@@ -99,65 +167,21 @@ async def create_ticket(
 
     result: dict = {"success": True, "ticket": incident}
 
-    # Auto-create a private Slack channel for the incident
-    logger.debug(
-        "Channel creation: _settings type=%s, _user_id=%r, ticket_id=%s",
-        type(_settings).__name__,
-        _user_id,
-        incident.get("ticket_id"),
-    )
-    try:
-        slack = AsyncWebClient(token=_settings.slack_bot_token)
-
-        # Look up user's display name for channel naming
-        user_info = await slack.users_info(user=_user_id)
-        username = user_info["user"]["name"]
-
-        # Slack channel names: lowercase, no spaces, max 80 chars
-        inc_number = incident["ticket_id"].lower()
-        channel_name = f"{inc_number}-{username}"[:80]
-
-        channel_resp = await slack.conversations_create(
-            name=channel_name, is_private=True
+    # Optionally create a private Slack channel for the incident.
+    # When create_channel=False (e.g. #help-it deferred flow), skip this
+    # entirely and return ticket-only data.
+    if create_channel:
+        logger.debug(
+            "Channel creation: _settings type=%s, _user_id=%r, ticket_id=%s",
+            type(_settings).__name__,
+            _user_id,
+            incident.get("ticket_id"),
         )
-        channel_id = channel_resp["channel"]["id"]
-
-        result["channel_name"] = channel_name
-        result["channel_id"] = channel_id
-
-        # Invite the requester to the channel (isolated so a failure here
-        # does not prevent the summary message from being posted).
-        try:
-            await slack.conversations_invite(channel=channel_id, users=_user_id)
-        except Exception as exc:
-            if "already_in_channel" in str(exc):
-                logger.debug("Requester %s already in channel %s", _user_id, channel_id)
-            else:
-                logger.warning(
-                    "Failed to invite requester %s to channel %s: %s",
-                    _user_id, channel_id, exc,
-                )
-
-        # Post initial message with incident summary + ServiceNow link
-        sn_link = (
-            f"{_settings.sn_instance_url}/incident.do"
-            f"?sysparm_query=number={incident['ticket_id']}"
-        )
-        message = (
-            f"*Incident {incident['ticket_id']}*\n"
-            f"*Title:* {incident['title']}\n"
-            f"*Priority:* {incident['priority']}\n"
-            f"*Description:* {incident['description']}\n\n"
-            f"<{sn_link}|View in ServiceNow>"
-        )
-        msg_resp = await slack.chat_postMessage(channel=channel_id, text=message)
-        result["summary_ts"] = msg_resp["ts"]
-    except Exception:
-        logger.warning(
-            "Failed to create Slack channel for %s",
-            incident["ticket_id"],
-            exc_info=True,
-        )
+        ch = await create_incident_channel(incident, _settings, _user_id)
+        if ch:
+            result["channel_name"] = ch["channel_name"]
+            result["channel_id"] = ch["channel_id"]
+            result["summary_ts"] = ch["summary_ts"]
 
     return result
 

@@ -22,6 +22,7 @@ from it_agent.bot.formatters import (
 from it_agent.config import Settings
 from it_agent import db
 from it_agent.servicenow.client import ServiceNowClient
+from it_agent.tools.tickets import create_incident_channel, create_ticket as _create_ticket_tool, get_ticket
 from it_agent.tools.users import resolve_sn_user_to_slack
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,9 @@ _incident_channels: set[str] = set()
 
 # Per-incident-channel context: channel_id → {ticket_id, title, description, ...}
 _incident_context: dict[str, dict] = {}
+
+# Pending channel creation: ticket_id → {user_id, ticket, kb_results, thread_ts, channel}
+_pending_channels: dict[str, dict] = {}
 
 # Resolved tickets pending auto-close: ticket_id → resolved_epoch
 _resolved_pending_close: dict[str, float] = {}
@@ -147,6 +151,31 @@ async def _recover_thread_history(
     except Exception:
         logger.warning("Failed to recover thread history", exc_info=True)
         return []
+
+
+def _strip_channel_created_lines(text: str, channel_name: str) -> str:
+    """Remove lines about the private channel being created from agent text.
+
+    Keeps ticket/incident references but strips the "a private channel #xyz
+    has been created" boilerplate so the message makes sense when posted
+    *inside* that channel.
+    """
+    filtered: list[str] = []
+    for line in text.split("\n"):
+        lower = line.lower()
+        # Skip lines that talk about channel creation
+        if "private channel" in lower and "created" in lower:
+            continue
+        if channel_name and f"#{channel_name}" in lower and "created" in lower:
+            continue
+        if "has been created to troubleshoot" in lower:
+            continue
+        filtered.append(line)
+    # Collapse multiple blank lines that may result from stripping
+    result = "\n".join(filtered)
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result.strip()
 
 
 def _parse_incident_message(text: str) -> dict:
@@ -512,6 +541,81 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         await emit("article_denied", {"article_id": article_id, "denier": denier_name})
 
+    # --- Move to private channel action ---
+
+    @app.action("move_to_private_channel")
+    async def handle_move_to_private_channel(ack, body) -> None:
+        await ack()
+        ticket_id = body["actions"][0]["value"]
+        channel = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        thread_ts = body["message"].get("thread_ts") or message_ts
+
+        client = AsyncWebClient(token=settings.slack_bot_token)
+
+        # Check if channel already exists (idempotent)
+        for ch_id, ctx in _incident_context.items():
+            if ctx.get("ticket_id") == ticket_id:
+                # Channel already created — update the button message
+                try:
+                    await client.chat_update(
+                        channel=channel,
+                        ts=message_ts,
+                        text=f":white_check_mark: Private channel <#{ch_id}> has been created for {ticket_id}.",
+                        blocks=[{
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f":white_check_mark: Private channel <#{ch_id}> already exists for {ticket_id}.",
+                            },
+                        }],
+                    )
+                except Exception:
+                    logger.debug("Failed to update button message", exc_info=True)
+                return
+
+        # Create the channel
+        result = await _create_deferred_channel(ticket_id, settings)
+        if result is None:
+            try:
+                await client.chat_postMessage(
+                    channel=channel,
+                    text=f":warning: Failed to create private channel for {ticket_id}.",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.debug("Failed to post channel creation failure message", exc_info=True)
+            return
+
+        channel_id = result["channel_id"]
+
+        # Replace the button message with confirmation
+        try:
+            await client.chat_update(
+                channel=channel,
+                ts=message_ts,
+                text=f":white_check_mark: Private channel <#{channel_id}> has been created for {ticket_id}.",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":white_check_mark: Private channel <#{channel_id}> has been created for {ticket_id}.",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update button message", exc_info=True)
+
+        # Post in the thread
+        try:
+            await client.chat_postMessage(
+                channel=channel,
+                text=f":arrow_right: A private channel <#{channel_id}> has been created. Further troubleshooting will continue there.",
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.debug("Failed to post channel created thread message", exc_info=True)
+
 
 async def _register_incident_channels(result: AgentResult) -> None:
     """Track any incident channels created during this agent run."""
@@ -822,10 +926,108 @@ async def _update_incident_summary(
         logger.warning("Failed to update incident summary in %s", channel, exc_info=True)
 
 
+async def _create_deferred_channel(
+    ticket_id: str, settings: Settings,
+) -> dict | None:
+    """Create a deferred incident channel for a ticket.
+
+    Uses ``_pending_channels`` when available; falls back to fetching the
+    ticket from ServiceNow (handles bot restarts).
+
+    Returns ``{channel_id, channel_name}`` on success or ``None`` on failure.
+    """
+    pending = _pending_channels.get(ticket_id)
+    if pending:
+        user_id = pending["user_id"]
+        ticket = pending["ticket"]
+    else:
+        # Fallback: fetch from ServiceNow (bot may have restarted)
+        logger.info("No pending data for %s — fetching from ServiceNow", ticket_id)
+        sn_result = await get_ticket(ticket_id, _settings=settings)
+        if sn_result.get("error"):
+            logger.warning("Could not fetch ticket %s from ServiceNow: %s", ticket_id, sn_result["error"])
+            return None
+        ticket = sn_result["ticket"]
+        user_id = "unknown"
+
+    ch = await create_incident_channel(ticket, settings, user_id)
+    if not ch:
+        return None
+
+    channel_id = ch["channel_id"]
+    channel_name = ch["channel_name"]
+
+    # Register in global tracking
+    _incident_channels.add(channel_id)
+    _incident_context[channel_id] = {
+        "ticket_id": ticket_id,
+        "title": ticket.get("title", ""),
+        "description": ticket.get("description", ""),
+        "priority": ticket.get("priority", "medium"),
+        "summary_ts": ch.get("summary_ts"),
+        "original_text": None,
+        "summary_lines": [],
+    }
+    await emit("channel_created", {
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "ticket_id": ticket_id,
+    })
+
+    slack = AsyncWebClient(token=settings.slack_bot_token)
+
+    # Post permalink to the original #help-it thread (if we have it)
+    thread_info = _ticket_threads.get(ticket_id)
+    if thread_info:
+        help_channel, thread_ts = thread_info
+        try:
+            plink = await slack.chat_getPermalink(
+                channel=help_channel, message_ts=thread_ts,
+            )
+            permalink = plink.get("permalink", "")
+            if permalink:
+                await slack.chat_postMessage(
+                    channel=channel_id,
+                    text=f":link: <{permalink}|Original #help-it thread>",
+                )
+        except Exception:
+            logger.debug("Failed to post permalink in deferred channel %s", channel_id, exc_info=True)
+
+    # Post any stored KB results
+    if pending and pending.get("kb_results"):
+        await _post_kb_results_to_channel(channel_id, pending["kb_results"], settings)
+
+    # Replicate the last agent response into the channel
+    if pending and pending.get("thread_ts") and pending.get("channel"):
+        conv_key = (pending["channel"], pending["thread_ts"])
+        history = _conversations.get(conv_key, [])
+        # Find last assistant message
+        for msg in reversed(history):
+            if msg["role"] == "assistant":
+                try:
+                    sn_url = settings.sn_instance_url
+                    ch_text = _strip_channel_created_lines(msg["content"], channel_name)
+                    if ch_text.strip():
+                        ch_linked = linkify_servicenow_refs(ch_text, sn_url)
+                        ch_blocks = format_response_blocks(ch_text, sn_url)
+                        await slack.chat_postMessage(
+                            channel=channel_id, text=ch_linked, blocks=ch_blocks,
+                        )
+                except Exception:
+                    logger.debug("Failed to replicate agent response in deferred channel", exc_info=True)
+                break
+
+    # Clean up pending entry
+    _pending_channels.pop(ticket_id, None)
+
+    logger.info("Deferred channel %s created for ticket %s", channel_name, ticket_id)
+    return {"channel_id": channel_id, "channel_name": channel_name}
+
+
 async def _handle_help_channel_message(
     event: dict, text: str, say, settings: Settings
 ) -> None:
-    """Handle a message in #help-it — same as _handle_message but with ticket follow-up."""
+    """Handle a message in #help-it — auto-creates ticket, then runs agent."""
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
@@ -836,16 +1038,77 @@ async def _handle_help_channel_message(
     })
 
     conv_key = (channel, thread_ts)
+    is_new_thread = conv_key not in _conversations and not event.get("thread_ts")
 
-    # Recover history from Slack if we have none (e.g. after bot restart)
+    # ── Auto-create ticket on first message in a new thread (no channel yet) ──
+    auto_ticket_info: dict | None = None
+    if is_new_thread:
+        try:
+            ticket_result = await _create_ticket_tool(
+                title=text[:120],
+                description=text,
+                priority="medium",
+                create_channel=False,
+                _settings=settings,
+                _user_id=user_id,
+            )
+            if ticket_result.get("success"):
+                auto_ticket_info = ticket_result
+                ticket = ticket_result.get("ticket", {})
+                ticket_id = ticket.get("ticket_id", "")
+
+                if ticket_id:
+                    _ticket_threads[ticket_id] = (channel, thread_ts)
+                    # Store for deferred channel creation
+                    _pending_channels[ticket_id] = {
+                        "user_id": user_id,
+                        "ticket": ticket,
+                        "kb_results": [],
+                        "thread_ts": thread_ts,
+                        "channel": channel,
+                    }
+
+                await emit("ticket_created", {
+                    "ticket_id": ticket_id,
+                    "title": ticket.get("title", ""),
+                    "priority": ticket.get("priority", "medium"),
+                    "channel_id": "",
+                })
+
+                logger.info(
+                    "Auto-created ticket %s (no channel) for help-it message",
+                    ticket_id,
+                )
+            else:
+                logger.warning("Auto ticket creation failed: %s", ticket_result)
+        except Exception:
+            logger.exception("Failed to auto-create ticket for help-it message")
+
+    # ── Build / recover conversation history ──
     if conv_key not in _conversations:
         recovered = await _recover_thread_history(channel, thread_ts, settings)
         if recovered:
             _conversations[conv_key] = recovered
             history = _conversations[conv_key]
         else:
-            _conversations[conv_key] = [{"role": "user", "content": text}]
-            history = _conversations[conv_key]
+            history = []
+            # Inject ticket context so the agent knows about the auto-created ticket
+            if auto_ticket_info:
+                ticket = auto_ticket_info.get("ticket", {})
+                ticket_id = ticket.get("ticket_id", "")
+                context_msg = (
+                    f"[System: A ticket {ticket_id} has been created automatically for "
+                    f"this request. No private channel has been created yet — the "
+                    f"conversation continues in this #help-it thread. Do NOT call "
+                    f"create_ticket — it is already done. Do NOT mention a private "
+                    f"channel. Focus on diagnosing the issue, searching the KB, and "
+                    f"helping the user. Reference {ticket_id} in your response.]\n\n"
+                    f"{text}"
+                )
+                history.append({"role": "user", "content": context_msg})
+            else:
+                history.append({"role": "user", "content": text})
+            _conversations[conv_key] = history
     else:
         history = _conversations[conv_key]
         history.append({"role": "user", "content": text})
@@ -854,9 +1117,17 @@ async def _handle_help_channel_message(
     if conv_key not in _interaction_ids:
         try:
             requester_name = await _resolve_user_name(user_id, settings)
+            ticket_id_for_interaction = ""
+            priority_for_interaction = "medium"
+            if auto_ticket_info:
+                t = auto_ticket_info.get("ticket", {})
+                ticket_id_for_interaction = t.get("ticket_id", "")
+                priority_for_interaction = t.get("priority", "medium")
             iid = await db.create_interaction(
                 channel_id=channel, thread_ts=thread_ts, source="help-it",
                 requester_slack_id=user_id, requester_name=requester_name,
+                ticket_id=ticket_id_for_interaction,
+                priority=priority_for_interaction,
             )
             _interaction_ids[conv_key] = iid
         except Exception:
@@ -884,13 +1155,51 @@ async def _handle_help_channel_message(
         blocks = format_response_blocks(result.text, sn_url)
         await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
 
-        # Forward thread replies to the incident channel
+        # ── Post ticket follow-up with "Move to private channel" button ──
+        if auto_ticket_info and auto_ticket_info.get("success"):
+            ticket = auto_ticket_info.get("ticket", {})
+            ticket_id = ticket.get("ticket_id", "")
+
+            if ticket_id:
+                followup_text = (
+                    f":ticket: *Ticket {ticket_id} created.* "
+                    f"The conversation continues here in this thread. "
+                    f"If you need a dedicated private channel, click the button below."
+                )
+                followup_text = linkify_servicenow_refs(followup_text, sn_url)
+                followup_blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": followup_text,
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Move to private channel"},
+                                "action_id": "move_to_private_channel",
+                                "value": ticket_id,
+                                "style": "primary",
+                            }
+                        ],
+                    },
+                ]
+                await say(
+                    text=followup_text,
+                    blocks=followup_blocks,
+                    thread_ts=thread_ts,
+                )
+
+        # Forward thread replies to the incident channel (if one exists)
         if event.get("thread_ts"):
             try:
                 inc_channel = _find_incident_channel_for_thread(channel, thread_ts)
                 if inc_channel:
                     slack = AsyncWebClient(token=settings.slack_bot_token)
-                    # Resolve display name for attribution
                     try:
                         user_info = await slack.users_info(user=user_id)
                         display_name = (
@@ -909,7 +1218,7 @@ async def _handle_help_channel_message(
             except Exception:
                 logger.debug("Failed to forward thread reply to incident channel", exc_info=True)
 
-        # Collect KB results from this run
+        # Collect KB results from this run and store for deferred channel
         kb_results: list[dict] = []
         for tc in result.tool_calls:
             if tc["name"] == "search_knowledge_base":
@@ -921,74 +1230,24 @@ async def _handle_help_channel_message(
                 "article_ids": [a.get("id", "") for a in kb_results],
             })
 
-        # Post threaded follow-ups for any tickets created during this run
+        # Store KB results in pending for deferred channel posting
+        if auto_ticket_info and kb_results:
+            ticket_id = auto_ticket_info.get("ticket", {}).get("ticket_id", "")
+            if ticket_id and ticket_id in _pending_channels:
+                _pending_channels[ticket_id]["kb_results"] = kb_results
+
+        # Handle any additional tickets the agent may have created (shouldn't happen
+        # but keep as safety net)
         for tc in result.tool_calls:
             if tc["name"] != "create_ticket":
                 continue
             r = tc.get("result", {})
             if not r.get("success"):
                 continue
-
             ticket = r.get("ticket", {})
-            ticket_id = ticket.get("ticket_id", "")
-            channel_name = r.get("channel_name", "")
-            channel_id = r.get("channel_id", "")
-
-            if not ticket_id:
-                continue
-
-            # Avoid duplicate follow-ups for the same ticket
-            if ticket_id in _ticket_threads:
-                continue
-
-            _ticket_threads[ticket_id] = (channel, thread_ts)
-
-            # Update interaction with ticket info and SN categorization
-            if iid is not None:
-                try:
-                    await db.update_interaction(
-                        iid,
-                        ticket_id=ticket_id,
-                        category=ticket.get("category", ""),
-                        subcategory=ticket.get("subcategory", ""),
-                        priority=ticket.get("priority", "medium"),
-                    )
-                except Exception:
-                    logger.debug("Failed to update interaction with ticket info", exc_info=True)
-
-            followup = (
-                f":ticket: *Ticket {ticket_id} created.* "
-                f"A private channel *#{channel_name}* has been created "
-                f"to troubleshoot this issue. Updates will be posted here "
-                f"after resolution."
-            )
-            followup = linkify_servicenow_refs(followup, sn_url)
-            await say(text=followup, thread_ts=thread_ts)
-
-            # Post a permalink to the original #help-it thread in the incident channel
-            if channel_id:
-                try:
-                    slack = AsyncWebClient(token=settings.slack_bot_token)
-                    plink = await slack.chat_getPermalink(
-                        channel=channel, message_ts=thread_ts,
-                    )
-                    permalink = plink.get("permalink", "")
-                    if permalink:
-                        await slack.chat_postMessage(
-                            channel=channel_id,
-                            text=f":link: <{permalink}|Original #help-it thread>",
-                        )
-                except Exception:
-                    logger.debug(
-                        "Failed to post thread permalink in incident channel %s",
-                        channel_id, exc_info=True,
-                    )
-
-            # Post KB article content in the incident channel
-            if kb_results and channel_id:
-                await _post_kb_results_to_channel(
-                    channel_id, kb_results, settings,
-                )
+            tid = ticket.get("ticket_id", "")
+            if tid and tid not in _ticket_threads:
+                _ticket_threads[tid] = (channel, thread_ts)
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
@@ -1151,13 +1410,38 @@ async def post_resolution_update(
 async def _handle_ticket_assigned(
     ticket_id: str, assignee_sn_sys_id: str, settings: Settings
 ) -> None:
-    """Invite the assigned user to the incident Slack channel and post a notification."""
+    """Invite the assigned user to the incident Slack channel and post a notification.
+
+    If no channel exists yet (deferred flow), auto-creates one first.
+    """
     # Reverse-lookup: find channel_id whose context has this ticket_id
     channel_id: str | None = None
     for ch_id, ctx in _incident_context.items():
         if ctx.get("ticket_id") == ticket_id:
             channel_id = ch_id
             break
+
+    # Auto-create channel if ticket is pending (deferred flow / escalation)
+    if channel_id is None and (ticket_id in _pending_channels or ticket_id in _ticket_threads):
+        logger.info("Escalation: auto-creating channel for ticket %s", ticket_id)
+        ch_result = await _create_deferred_channel(ticket_id, settings)
+        if ch_result:
+            channel_id = ch_result["channel_id"]
+            # Notify the #help-it thread about escalation
+            thread_info = _ticket_threads.get(ticket_id)
+            if thread_info:
+                try:
+                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    await slack.chat_postMessage(
+                        channel=thread_info[0],
+                        text=(
+                            f":bust_in_silhouette: Ticket {ticket_id} has been assigned to a human agent. "
+                            f"A private channel <#{channel_id}> has been created for further troubleshooting."
+                        ),
+                        thread_ts=thread_info[1],
+                    )
+                except Exception:
+                    logger.debug("Failed to post escalation notice in #help-it thread", exc_info=True)
 
     if channel_id is None:
         logger.debug("No incident channel found for ticket %s — skipping invite", ticket_id)
