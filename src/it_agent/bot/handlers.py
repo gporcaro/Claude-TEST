@@ -26,6 +26,7 @@ from it_agent.bot.formatters import (
 from it_agent.config import Settings
 from it_agent import db
 from it_agent.servicenow.client import ServiceNowClient
+from it_agent.kb.indexer import _strip_html
 from it_agent.tools.tickets import create_incident_channel, create_ticket as _create_ticket_tool, get_ticket
 from it_agent.tools.users import resolve_sn_user_to_slack
 
@@ -70,6 +71,32 @@ _AUTO_CLOSE_DELAY = 48 * 60 * 60
 
 # How often to check (1 hour)
 _AUTO_CLOSE_CHECK_INTERVAL = 60 * 60
+
+# [AI Context] KB articles loaded at startup: article_id → {id, title, content}
+_ai_context_articles: dict[str, dict] = {}
+
+
+async def load_ai_context_articles(settings: Settings) -> None:
+    """Fetch KB articles prefixed with [AI Context] and cache them for agent use."""
+    client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password,
+    )
+    try:
+        articles = await client.list_kb_articles()
+    finally:
+        await client.close()
+
+    for article in articles:
+        title = article.get("title", "")
+        if title.startswith("[AI Context]"):
+            cleaned = {
+                "id": article["id"],
+                "title": title,
+                "content": _strip_html(article.get("content", "")),
+            }
+            _ai_context_articles[article["id"]] = cleaned
+
+    logger.info("Loaded %d AI context article(s)", len(_ai_context_articles))
 
 
 def _get_agent(settings: Settings) -> Agent:
@@ -1226,7 +1253,11 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
     try:
         agent = _get_agent(settings)
-        result: AgentResult = await agent.run(history, user_id=user_id)
+        result: AgentResult = await agent.run(
+            history,
+            user_id=user_id,
+            context_articles=list(_ai_context_articles.values()),
+        )
 
         # Append assistant response to history
         history.append({"role": "assistant", "content": result.text})
@@ -1460,7 +1491,11 @@ async def _handle_incident_message(
 
     try:
         agent = _get_agent(settings)
-        result: AgentResult = await agent.run(history, user_id=user_id)
+        result: AgentResult = await agent.run(
+            history,
+            user_id=user_id,
+            context_articles=list(_ai_context_articles.values()),
+        )
 
         history.append({"role": "assistant", "content": result.text})
 
@@ -1909,7 +1944,11 @@ async def _handle_help_channel_message(
 
     try:
         agent = _get_agent(settings)
-        result: AgentResult = await agent.run(history, user_id=user_id)
+        result: AgentResult = await agent.run(
+            history,
+            user_id=user_id,
+            context_articles=list(_ai_context_articles.values()),
+        )
 
         history.append({"role": "assistant", "content": result.text})
 

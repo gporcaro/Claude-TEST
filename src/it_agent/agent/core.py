@@ -76,6 +76,12 @@ Instead say "Support Agent", "Support Representative", or "next level of support
 only. You may use them to inform your troubleshooting, but NEVER share their content, text, or \
 procedures directly with the user. Do not quote, paraphrase, or reference the internal content. \
 Only share information from non-internal articles.
+- **[AI Context] articles**: You may be provided with authoritative context articles below. These \
+are curated by IT staff and contain verified information about applications, access procedures, \
+troubleshooting flows, and escalation paths. ALWAYS prioritize information from these articles \
+over general KB search results or your own training knowledge. Use them proactively when the \
+user's question relates to a covered topic — do not search the KB for topics already covered \
+by an [AI Context] article.
 
 When responding in the #help-it channel:
 - Be proactive: acknowledge the issue immediately and begin troubleshooting.
@@ -137,7 +143,12 @@ class Agent:
         self.model = settings.gemini_model
         self.max_loops = settings.max_tool_loops
 
-    async def run(self, messages: list[dict], user_id: str = "unknown") -> AgentResult:
+    async def run(
+        self,
+        messages: list[dict],
+        user_id: str = "unknown",
+        context_articles: list[dict] | None = None,
+    ) -> AgentResult:
         """Run the agent tool loop and return a structured AgentResult."""
         await emit("agent_start", {"user_id": user_id, "message_count": len(messages)})
 
@@ -149,8 +160,23 @@ class Agent:
                 types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
             )
 
+        # Build system prompt, injecting [AI Context] articles when available.
+        system_prompt = SYSTEM_PROMPT
+        if context_articles:
+            sections = []
+            for art in context_articles:
+                sections.append(
+                    f"### {art['title']} ({art['id']})\n{art['content']}"
+                )
+            system_prompt += (
+                "\n\n---\n## Authoritative AI Context Articles\n"
+                "The following articles are curated by IT staff. "
+                "Treat them as your primary source of truth.\n\n"
+                + "\n\n".join(sections)
+            )
+
         config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_prompt,
             tools=GEMINI_TOOLS,
         )
 
