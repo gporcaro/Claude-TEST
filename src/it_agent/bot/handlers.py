@@ -209,6 +209,35 @@ def _ticket_id_from_channel_name(channel_name: str) -> str | None:
     return None
 
 
+_ESCALATION_PATTERNS = re.compile(
+    r"\b(human|person|someone|escalat|talk\s+to|speak\s+to|real\s+person|"
+    r"transfer|assign|technician|agent|help\s+desk|helpdesk)\b",
+    re.IGNORECASE,
+)
+
+
+def _recover_ticket_thread_mapping(
+    channel: str, thread_ts: str, history: list[dict],
+) -> str | None:
+    """Scan recovered thread messages for a ticket ID and repopulate _ticket_threads.
+
+    Returns the ticket_id if found, or None.
+    """
+    for msg in history:
+        # Look for INC numbers in bot messages (from the follow-up or context)
+        m = re.search(r"(INC\d{7,})", msg["content"])
+        if m:
+            ticket_id = m.group(1)
+            if ticket_id not in _ticket_threads:
+                _ticket_threads[ticket_id] = (channel, thread_ts)
+                logger.info(
+                    "Recovered ticket-thread mapping: %s → (%s, %s)",
+                    ticket_id, channel, thread_ts,
+                )
+            return ticket_id
+    return None
+
+
 def _find_incident_channel_for_thread(channel: str, thread_ts: str) -> str | None:
     """Reverse-lookup: find the incident channel associated with a #help-it thread.
 
@@ -1211,6 +1240,8 @@ async def _handle_help_channel_message(
         if recovered:
             _conversations[conv_key] = recovered
             history = _conversations[conv_key]
+            # Recover ticket-thread mapping from thread content (survives restarts)
+            _recover_ticket_thread_mapping(channel, thread_ts, recovered)
         else:
             history = []
             # Inject ticket context so the agent knows about the auto-created ticket
@@ -1403,6 +1434,45 @@ async def _handle_help_channel_message(
                     )
                 except Exception:
                     logger.debug("Failed to post escalation channel notice", exc_info=True)
+
+        # ── Keyword fallback: user asked for a human but agent didn't call update_ticket ──
+        if _ESCALATION_PATTERNS.search(text):
+            # Find the ticket for this thread
+            fallback_ticket_id: str | None = None
+            for tid, (ch, ts) in _ticket_threads.items():
+                if ch == channel and ts == thread_ts:
+                    fallback_ticket_id = tid
+                    break
+            if fallback_ticket_id:
+                already_has_channel = any(
+                    ctx.get("ticket_id") == fallback_ticket_id
+                    for ctx in _incident_context.values()
+                )
+                if not already_has_channel:
+                    logger.info(
+                        "Keyword escalation fallback: creating channel for %s",
+                        fallback_ticket_id,
+                    )
+                    ch_result = await _create_deferred_channel(
+                        fallback_ticket_id, settings,
+                        thread_info=(channel, thread_ts),
+                        user_id=user_id,
+                        reason="escalation",
+                    )
+                    if ch_result:
+                        ch_id = ch_result["channel_id"]
+                        try:
+                            slack = AsyncWebClient(token=settings.slack_bot_token)
+                            await slack.chat_postMessage(
+                                channel=channel,
+                                text=(
+                                    f":rotating_light: Ticket {fallback_ticket_id} has been escalated. "
+                                    f"A private channel <#{ch_id}> has been created for further troubleshooting."
+                                ),
+                                thread_ts=thread_ts,
+                            )
+                        except Exception:
+                            logger.debug("Failed to post keyword escalation notice", exc_info=True)
 
         # Handle any additional tickets the agent may have created (shouldn't happen
         # but keep as safety net)
