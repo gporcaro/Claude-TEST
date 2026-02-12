@@ -104,6 +104,15 @@ a private channel and queue the ticket for assignment. Do NOT say a technician "
 notified" or "will contact" the user unless the ticket has actually been assigned to a \
 specific person via `assignee_id`. Be honest: say "I've escalated the ticket — it's now in \
 the queue for a Support Agent."
+When responding in an incident channel (private channels named like inc0129540-username):
+- You are ALREADY in a private troubleshooting channel. Do NOT mention creating a private channel \
+or say a Support Agent will "reach out in a private channel" — the user is already here.
+- **Escalation**: When the user asks for a real person or to escalate, call `update_ticket` with \
+`priority="high"` and a `comment` noting the escalation request. Then tell the user: "I've \
+escalated the ticket to high priority. IT staff have been notified in #it-helpdesk and will \
+join this channel to assist you." Do NOT promise someone will "reach out" or "contact you in \
+a private channel" — they are already in the channel.
+
 - When the user confirms the issue is resolved (e.g., "that worked", "all good", "this helped", \
 "that would be all"), **do NOT immediately resolve the ticket**. First, carefully analyze the \
 user's message and the conversation history to determine if the resolution reason has already \

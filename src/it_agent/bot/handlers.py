@@ -1754,6 +1754,34 @@ async def _handle_incident_message(
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, None, settings)
 
+        # Notify #it-helpdesk when escalation happens in an incident channel
+        if settings.it_helpdesk_channel_id:
+            for tc in result.tool_calls:
+                if tc["name"] != "update_ticket":
+                    continue
+                args = tc.get("args", {})
+                if args.get("priority") not in ("high", "urgent"):
+                    continue
+                tc_ticket_id = args.get("ticket_id", "")
+                if not tc_ticket_id:
+                    continue
+                try:
+                    escalation_client = AsyncWebClient(token=settings.slack_bot_token)
+                    user_display = await _resolve_user_name(user_id, settings)
+                    await escalation_client.chat_postMessage(
+                        channel=settings.it_helpdesk_channel_id,
+                        text=(
+                            f":rotating_light: *Escalation: {tc_ticket_id}*\n"
+                            f"User <@{user_id}> ({user_display}) requested escalation "
+                            f"in <#{channel}>.\n"
+                            f"Priority set to *{args.get('priority')}*. "
+                            f"Please join the channel to assist."
+                        ),
+                    )
+                    logger.info("Posted escalation notice to #it-helpdesk for %s", tc_ticket_id)
+                except Exception:
+                    logger.debug("Failed to post escalation notice to #it-helpdesk", exc_info=True)
+
     except Exception as exc:
         logger.exception("Error processing incident channel message")
         await emit("error", {"source": "incident", "message": str(exc)[:300]})
