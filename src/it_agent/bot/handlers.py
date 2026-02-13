@@ -16,8 +16,11 @@ from it_agent.agent.core import Agent, AgentResult
 from it_agent.bot.events import emit
 from it_agent.bot.formatters import (
     format_approval_blocks,
+    format_collaborative_context_blocks,
+    format_collaborative_review_blocks,
     format_debug_blocks,
     format_error_blocks,
+    format_kb_suggestion_blocks,
     format_public_article_blocks,
     format_recommendation_approval_blocks,
     format_response_blocks,
@@ -940,6 +943,321 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             "approval_id": approval_id, "denier": denier_name,
         })
 
+    # --- Collaborative review actions ---
+
+    @app.action("collab_approve")
+    async def handle_collab_approve(ack, body) -> None:
+        await ack()
+        review_id = int(body["actions"][0]["value"])
+        approver_id = body["user"]["id"]
+        approver_name = await _resolve_user_name(approver_id, settings)
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            return
+
+        await db.update_collaborative_review(
+            review_id, status="approved", resolved_by=approver_name,
+        )
+
+        # Update user's placeholder message with the full original response
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            sn_url = settings.sn_instance_url
+            original = review["original_response"]
+            blocks = format_response_blocks(original, sn_url)
+            linked = linkify_servicenow_refs(original, sn_url)
+            await client.chat_update(
+                channel=review["channel_id"],
+                ts=review["placeholder_message_ts"],
+                text=linked,
+                blocks=blocks,
+            )
+            # Post thread notification so user gets a Slack ping
+            thread = review.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=review["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":white_check_mark: The response for this issue has been "
+                        "reviewed and approved by IT. Please see the updated message above."
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to update user message on collab approve", exc_info=True)
+
+        # Update the #it-helpdesk message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            ch = body["channel"]["id"]
+            ts = body["message"]["ts"]
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=f":white_check_mark: Collaborative review approved by {approver_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":white_check_mark: Collaborative review approved by {approver_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update collab approval message", exc_info=True)
+
+        await emit("collab_review_approved", {
+            "review_id": review_id, "approver": approver_name,
+        })
+
+    @app.action("collab_modify")
+    async def handle_collab_modify(ack, body) -> None:
+        await ack()
+        review_id = int(body["actions"][0]["value"])
+        trigger_id = body["trigger_id"]
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            return
+
+        # Open a Slack modal pre-filled with the original response
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            await client.views_open(
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "callback_id": "collab_modify_submit",
+                    "private_metadata": str(review_id),
+                    "title": {"type": "plain_text", "text": "Modify Response"},
+                    "submit": {"type": "plain_text", "text": "Send to User"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "response_block",
+                            "label": {"type": "plain_text", "text": "Modified Response"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "response_input",
+                                "multiline": True,
+                                "initial_value": review["original_response"][:3000],
+                            },
+                        }
+                    ],
+                },
+            )
+        except Exception:
+            logger.warning("Failed to open collab modify modal", exc_info=True)
+
+    @app.view("collab_modify_submit")
+    async def handle_collab_modify_submit(ack, body) -> None:
+        await ack()
+        review_id = int(body["view"]["private_metadata"])
+        modifier_id = body["user"]["id"]
+        modifier_name = await _resolve_user_name(modifier_id, settings)
+
+        modified_text = (
+            body["view"]["state"]["values"]
+            ["response_block"]["response_input"]["value"]
+        )
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            return
+
+        await db.update_collaborative_review(
+            review_id,
+            status="modified",
+            resolved_by=modifier_name,
+            modified_response=modified_text,
+        )
+
+        # Update user's placeholder with the modified response
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            sn_url = settings.sn_instance_url
+            blocks = format_response_blocks(modified_text, sn_url)
+            linked = linkify_servicenow_refs(modified_text, sn_url)
+            await client.chat_update(
+                channel=review["channel_id"],
+                ts=review["placeholder_message_ts"],
+                text=linked,
+                blocks=blocks,
+            )
+            thread = review.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=review["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":white_check_mark: The response for this issue has been "
+                        "reviewed and updated by IT. Please see the updated message above."
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to update user message on collab modify", exc_info=True)
+
+        # Update #it-helpdesk message
+        helpdesk_ts = review.get("helpdesk_message_ts")
+        if helpdesk_ts and settings.it_helpdesk_channel_id:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_update(
+                    channel=settings.it_helpdesk_channel_id,
+                    ts=helpdesk_ts,
+                    text=f":pencil2: Collaborative review modified and sent by {modifier_name}",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f":pencil2: Collaborative review modified and sent by {modifier_name}",
+                        },
+                    }],
+                )
+            except Exception:
+                logger.debug("Failed to update collab modify helpdesk message", exc_info=True)
+
+        await emit("collab_review_modified", {
+            "review_id": review_id, "modifier": modifier_name,
+        })
+
+    @app.action("collab_takeover")
+    async def handle_collab_takeover(ack, body) -> None:
+        await ack()
+        review_id = int(body["actions"][0]["value"])
+        takeover_id = body["user"]["id"]
+        takeover_name = await _resolve_user_name(takeover_id, settings)
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            return
+
+        await db.update_collaborative_review(
+            review_id, status="taken_over", resolved_by=takeover_name,
+        )
+
+        # Update user's placeholder to indicate takeover
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            takeover_text = (
+                ":bust_in_silhouette: _A Support Agent is taking over this issue. "
+                "They'll be with you shortly._"
+            )
+            await client.chat_update(
+                channel=review["channel_id"],
+                ts=review["placeholder_message_ts"],
+                text=takeover_text,
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": takeover_text},
+                }],
+            )
+            # Post thread notification
+            thread = review.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=review["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        f":bust_in_silhouette: {takeover_name} from IT is taking "
+                        f"over this issue and will assist you directly."
+                    ),
+                )
+
+            # If an incident channel exists for this ticket, invite IT staff
+            ticket_id = review.get("ticket_id", "")
+            if ticket_id:
+                for ch_id, ctx in _incident_context.items():
+                    if ctx.get("ticket_id") == ticket_id:
+                        try:
+                            await client.conversations_invite(
+                                channel=ch_id, users=takeover_id,
+                            )
+                        except Exception:
+                            pass  # already_in_channel or other
+                        break
+        except Exception:
+            logger.debug("Failed to update user message on collab takeover", exc_info=True)
+
+        # Update the #it-helpdesk message
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            ch = body["channel"]["id"]
+            ts = body["message"]["ts"]
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=f":bust_in_silhouette: Collaborative review taken over by {takeover_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":bust_in_silhouette: Collaborative review taken over by {takeover_name}",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update collab takeover message", exc_info=True)
+
+        await emit("collab_review_takeover", {
+            "review_id": review_id, "taken_over_by": takeover_name,
+        })
+
+    # --- KB suggestion actions (collaborative review) ---
+
+    @app.action("collab_create_kb")
+    async def handle_collab_create_kb(ack, body) -> None:
+        await ack()
+        review_id = int(body["actions"][0]["value"])
+        creator_id = body["user"]["id"]
+        creator_name = await _resolve_user_name(creator_id, settings)
+
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=body["message"]["ts"],
+                text=f":books: KB article creation accepted by {creator_name}. Please create in ServiceNow.",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":books: KB article creation accepted by {creator_name}. Please create in ServiceNow.",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update KB creation message", exc_info=True)
+
+        await emit("collab_kb_accepted", {
+            "review_id": review_id, "creator": creator_name,
+        })
+
+    @app.action("collab_dismiss_kb")
+    async def handle_collab_dismiss_kb(ack, body) -> None:
+        await ack()
+        dismisser_id = body["user"]["id"]
+        dismisser_name = await _resolve_user_name(dismisser_id, settings)
+
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=body["message"]["ts"],
+                text=f":no_entry: KB suggestion dismissed by {dismisser_name}.",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":no_entry: KB suggestion dismissed by {dismisser_name}.",
+                    },
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update KB dismissal message", exc_info=True)
+
     # --- Move to private channel action ---
 
     @app.action("move_to_private_channel")
@@ -1225,6 +1543,25 @@ _BASIC_RECOMMENDATIONS = {
 }
 
 
+_HIGH_RISK_CATEGORIES = {"core_app_violation"}
+_HIGH_RISK_KEYWORDS = {
+    "uninstall", "remove application", "disable security", "disable antivirus",
+    "disable firewall", "disable endpoint", "stop security service",
+    "modify registry", "delete system", "factory reset", "wipe",
+}
+
+
+def _classify_risk_level(recommendations: list[dict]) -> str:
+    """Returns 'high', 'medium', or 'low'."""
+    for rec in recommendations:
+        if rec.get("category") in _HIGH_RISK_CATEGORIES:
+            return "high"
+        canonical = rec.get("canonical_form", "").lower()
+        if any(kw in canonical for kw in _HIGH_RISK_KEYWORDS):
+            return "high"
+    return "low"  # medium/low both use standard gating
+
+
 async def _extract_recommendations(
     response_text: str, settings: Settings,
 ) -> list[dict]:
@@ -1245,10 +1582,18 @@ async def _extract_recommendations(
                 "Do NOT include basic/generic advice like: restart, reboot, check cables, "
                 "clear cache, try again, log out/in, check internet, update browser, "
                 "close and reopen, power cycle.\n\n"
+                "CRITICAL — Core Application Protection:\n"
+                "These are IT-managed apps that CANNOT be uninstalled: GlobalProtect, "
+                "CrowdStrike/Falcon, Microsoft Intune/Company Portal, Jamf, Cisco AnyConnect, "
+                "Zscaler, Microsoft Defender, SentinelOne.\n"
+                "If the response suggests uninstalling, removing, or disabling ANY of these, "
+                'flag with category "core_app_violation". This must NEVER reach users without '
+                "IT review.\n\n"
                 "For each recommendation found, output a JSON array of objects with:\n"
                 '- "original_text": the exact text span from the response\n'
                 '- "canonical_form": a short normalized version (e.g. "disable hardware acceleration in Chrome")\n'
-                '- "category": one of "settings_change", "install", "command", "config_change", "feature_toggle"\n\n'
+                '- "category": one of "settings_change", "install", "command", "config_change", '
+                '"feature_toggle", "core_app_violation"\n\n'
                 "If there are NO specific actionable recommendations, return an empty array: []\n\n"
                 "IMPORTANT: Return ONLY the JSON array, no other text.\n\n"
                 f"Response to analyze:\n{response_text}"
@@ -1359,6 +1704,148 @@ async def _match_recommendations_to_db(
     return recommendations
 
 
+async def _open_collaborative_review(
+    response_text: str,
+    channel: str,
+    thread_ts: str | None,
+    say,
+    settings: Settings,
+    *,
+    recommendations: list[dict],
+    interaction_id: int | None = None,
+    user_name: str = "a user",
+) -> tuple[str, str | None]:
+    """Open a collaborative review thread in #it-helpdesk for high-risk responses.
+
+    Posts a placeholder to the user and sends the full response to IT staff for review.
+    Returns ``(placeholder_text, posted_ts)``.
+    """
+    # Build trigger reason from recommendations
+    trigger_parts = []
+    for rec in recommendations:
+        canonical = rec.get("canonical_form", "")
+        if canonical:
+            trigger_parts.append(canonical)
+    trigger_reason = "; ".join(trigger_parts) if trigger_parts else "high-risk recommendation"
+
+    # Look up ticket_id from _ticket_threads
+    ticket_id = ""
+    if thread_ts:
+        for tid, (ch, ts) in _ticket_threads.items():
+            if ch == channel and ts == thread_ts:
+                ticket_id = tid
+                break
+
+    # Resolve user_slack_id from conversation context
+    user_slack_id = ""
+    conv_key = (channel, thread_ts or "")
+    for key, iid in _interaction_ids.items():
+        if key == conv_key:
+            interaction = await db.get_interaction(iid)
+            if interaction:
+                user_slack_id = interaction.get("requester_slack_id", "")
+            break
+    if not user_slack_id:
+        # Fallback: try to get from channel context
+        for tid, (ch, ts) in _ticket_threads.items():
+            if ch == channel and ts == (thread_ts or ""):
+                interaction = await db.get_interaction_by_ticket(tid)
+                if interaction:
+                    user_slack_id = interaction.get("requester_slack_id", "")
+                break
+
+    # Build issue summary from conversation history
+    issue_summary = ""
+    history = _conversations.get(conv_key, [])
+    if history:
+        user_msgs = [m["content"] for m in history if m["role"] == "user"]
+        if user_msgs:
+            first_msg = user_msgs[0]
+            # Strip system context prefixes
+            if first_msg.startswith("[System"):
+                first_msg = first_msg.split("]\n\n", 1)[-1] if "]\n\n" in first_msg else first_msg
+            issue_summary = first_msg[:300]
+
+    # Post placeholder to user
+    placeholder_text = (
+        ":hourglass_flowing_sand: _I'm checking with the IT team on the best approach "
+        "for this issue. You'll be updated shortly._"
+    )
+    say_kwargs: dict = {"text": placeholder_text}
+    if thread_ts:
+        say_kwargs["thread_ts"] = thread_ts
+
+    msg_response = await say(**say_kwargs)
+    posted_ts = ""
+    if msg_response is not None:
+        if isinstance(msg_response, dict):
+            posted_ts = msg_response.get("ts", "")
+        elif hasattr(msg_response, "get"):
+            posted_ts = msg_response.get("ts", "")
+        elif hasattr(msg_response, "data"):
+            posted_ts = msg_response.data.get("ts", "")
+
+    # Create DB record
+    try:
+        review_id = await db.create_collaborative_review(
+            channel_id=channel,
+            thread_ts=thread_ts or "",
+            user_slack_id=user_slack_id,
+            user_name=user_name,
+            original_response=response_text,
+            trigger_reason=trigger_reason,
+            issue_summary=issue_summary,
+            risk_level="high",
+            interaction_id=interaction_id,
+            ticket_id=ticket_id or None,
+            placeholder_message_ts=posted_ts,
+        )
+    except Exception:
+        logger.warning("Failed to create collaborative review record", exc_info=True)
+        return placeholder_text, posted_ts
+
+    # Post thread-starting message in #it-helpdesk
+    if settings.it_helpdesk_channel_id:
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            review_blocks = format_collaborative_review_blocks(
+                review_id=review_id,
+                trigger_reason=trigger_reason,
+                original_response=response_text,
+                user_name=user_name,
+                ticket_id=ticket_id,
+                channel_id=channel,
+            )
+            resp = await client.chat_postMessage(
+                channel=settings.it_helpdesk_channel_id,
+                text=f":rotating_light: Collaborative Review: {trigger_reason}",
+                blocks=review_blocks,
+            )
+            helpdesk_ts = resp.get("ts", "")
+
+            # Post thread reply with full bot response
+            context_blocks = format_collaborative_context_blocks(
+                original_response=response_text,
+                issue_summary=issue_summary,
+            )
+            await client.chat_postMessage(
+                channel=settings.it_helpdesk_channel_id,
+                thread_ts=helpdesk_ts,
+                text=f"Full bot response for review",
+                blocks=context_blocks,
+            )
+
+            # Update DB with helpdesk message TS
+            await db.update_collaborative_review(
+                review_id,
+                helpdesk_message_ts=helpdesk_ts,
+            )
+        except Exception:
+            logger.warning("Failed to post collaborative review to #it-helpdesk", exc_info=True)
+
+    return placeholder_text, posted_ts
+
+
 async def _gate_recommendations(
     response_text: str,
     channel: str,
@@ -1382,6 +1869,16 @@ async def _gate_recommendations(
 
     # 2. Match against DB
     recommendations = await _match_recommendations_to_db(recommendations, settings)
+
+    # 2.5. Risk check: high-risk → collaborative review
+    risk_level = _classify_risk_level(recommendations)
+    if risk_level == "high":
+        return await _open_collaborative_review(
+            response_text, channel, thread_ts, say, settings,
+            recommendations=recommendations,
+            interaction_id=interaction_id,
+            user_name=user_name,
+        )
 
     # 3. Check if all are trusted
     if all(r.get("is_trusted") for r in recommendations):
@@ -2597,6 +3094,9 @@ async def post_resolution_update(
     _resolved_pending_close[ticket_id] = time.time()
     logger.info("Ticket %s queued for auto-close in 48h", ticket_id)
 
+    # Suggest KB article if this ticket had a collaborative review
+    asyncio.create_task(_suggest_kb_article_for_collab(ticket_id, ticket_data, settings))
+
     # Post resolution notice with "Archive Now" button in the incident channel
     channel_id: str | None = None
     for ch_id, ctx in _incident_context.items():
@@ -3011,3 +3511,244 @@ async def _process_expired_rec_approvals(settings: Settings) -> None:
                 )
 
         await emit("recommendation_auto_denied", {"approval_id": approval_id})
+
+
+# ---------------------------------------------------------------------------
+# Collaborative review timeout loop
+# ---------------------------------------------------------------------------
+
+async def start_collaborative_review_timeout_loop(settings: Settings) -> None:
+    """Background loop that handles timed-out collaborative reviews."""
+    while True:
+        await asyncio.sleep(_APPROVAL_CHECK_INTERVAL)
+        try:
+            await _process_expired_collaborative_reviews(settings)
+        except Exception:
+            logger.warning("Collaborative review timeout loop iteration failed", exc_info=True)
+
+
+async def _process_expired_collaborative_reviews(settings: Settings) -> None:
+    """Fall back to standard redact-and-approve for timed-out collaborative reviews."""
+    timeout = settings.collaborative_review_timeout_minutes
+    expired = await db.get_expired_collaborative_reviews(older_than_minutes=timeout)
+    if not expired:
+        return
+
+    logger.info("Processing %d expired collaborative review(s)", len(expired))
+    client = AsyncWebClient(token=settings.slack_bot_token)
+
+    for review in expired:
+        review_id = review["id"]
+        await db.update_collaborative_review(review_id, status="timed_out")
+
+        original = review["original_response"]
+        channel_id = review["channel_id"]
+        thread_ts = review.get("thread_ts", "")
+        placeholder_ts = review.get("placeholder_message_ts", "")
+
+        # Fall back: extract recommendations and use standard redact-and-approve
+        recommendations = await _extract_recommendations(original, settings)
+        if recommendations:
+            recommendations = await _match_recommendations_to_db(recommendations, settings)
+            untrusted = [r for r in recommendations if not r.get("is_trusted")]
+            if untrusted:
+                redacted_text = redact_recommendations(original, untrusted)
+
+                # Update user's placeholder with redacted text
+                if placeholder_ts:
+                    try:
+                        sn_url = settings.sn_instance_url
+                        blocks = format_response_blocks(redacted_text, sn_url)
+                        linked = linkify_servicenow_refs(redacted_text, sn_url)
+                        await client.chat_update(
+                            channel=channel_id,
+                            ts=placeholder_ts,
+                            text=linked,
+                            blocks=blocks,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to update placeholder for timed-out review %d",
+                            review_id, exc_info=True,
+                        )
+
+                # Create pending recommendation approval
+                rec_ids = [r["db_id"] for r in untrusted if r.get("db_id")]
+                try:
+                    approval_id = await db.create_pending_rec_approval(
+                        channel_id=channel_id,
+                        message_ts=placeholder_ts,
+                        original_text=original,
+                        redacted_text=redacted_text,
+                        recommendation_ids=rec_ids,
+                        thread_ts=thread_ts,
+                        interaction_id=review.get("interaction_id"),
+                    )
+
+                    # Post standard approval request to #it-helpdesk
+                    if settings.it_helpdesk_channel_id:
+                        approval_blocks = format_recommendation_approval_blocks(
+                            approval_id, untrusted, original,
+                            review.get("user_name", "a user"),
+                        )
+                        resp = await client.chat_postMessage(
+                            channel=settings.it_helpdesk_channel_id,
+                            text=f"Recommendation approval needed (timed out collaborative review)",
+                            blocks=approval_blocks,
+                        )
+                        await db.update_pending_rec_approval(
+                            approval_id,
+                            approval_message_ts=resp["ts"],
+                            approval_channel=settings.it_helpdesk_channel_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to create fallback approval for timed-out review %d",
+                        review_id, exc_info=True,
+                    )
+            else:
+                # All trusted now — post full response
+                if placeholder_ts:
+                    try:
+                        sn_url = settings.sn_instance_url
+                        blocks = format_response_blocks(original, sn_url)
+                        linked = linkify_servicenow_refs(original, sn_url)
+                        await client.chat_update(
+                            channel=channel_id, ts=placeholder_ts,
+                            text=linked, blocks=blocks,
+                        )
+                    except Exception:
+                        logger.debug("Failed to update placeholder for review %d", review_id, exc_info=True)
+        else:
+            # No recommendations found on re-extraction — post original
+            if placeholder_ts:
+                try:
+                    sn_url = settings.sn_instance_url
+                    blocks = format_response_blocks(original, sn_url)
+                    linked = linkify_servicenow_refs(original, sn_url)
+                    await client.chat_update(
+                        channel=channel_id, ts=placeholder_ts,
+                        text=linked, blocks=blocks,
+                    )
+                except Exception:
+                    logger.debug("Failed to update placeholder for review %d", review_id, exc_info=True)
+
+        # Update the #it-helpdesk message
+        helpdesk_ts = review.get("helpdesk_message_ts")
+        if helpdesk_ts and settings.it_helpdesk_channel_id:
+            try:
+                await client.chat_update(
+                    channel=settings.it_helpdesk_channel_id,
+                    ts=helpdesk_ts,
+                    text=f":hourglass: Collaborative review timed out — fell back to standard approval",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f":hourglass: Collaborative review timed out after "
+                                f"{timeout}min — fell back to standard approval"
+                            ),
+                        },
+                    }],
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to update helpdesk message for timed-out review %d",
+                    review_id, exc_info=True,
+                )
+
+        await emit("collab_review_timed_out", {"review_id": review_id})
+
+
+# ---------------------------------------------------------------------------
+# KB suggestion for collaborative reviews
+# ---------------------------------------------------------------------------
+
+async def _suggest_kb_article_for_collab(
+    ticket_id: str, ticket_data: dict, settings: Settings,
+) -> None:
+    """Check if a resolved ticket had a collaborative review and suggest a KB article."""
+    try:
+        review = await db.get_collaborative_review_by_ticket(ticket_id)
+        if not review:
+            return
+        if review["status"] == "pending":
+            return
+
+        # Collect conversation history for analysis
+        history = _collect_ticket_history(ticket_id)
+        if not history:
+            return
+
+        suggestion = await _generate_kb_suggestion(history, ticket_data, settings)
+        if not suggestion or not suggestion.get("worth_creating"):
+            return
+
+        # Post KB suggestion in the collaborative review's #it-helpdesk thread
+        helpdesk_ts = review.get("helpdesk_message_ts")
+        if not helpdesk_ts or not settings.it_helpdesk_channel_id:
+            return
+
+        kb_blocks = format_kb_suggestion_blocks(
+            review_id=review["id"],
+            suggested_title=suggestion.get("title", "Untitled"),
+            key_points=suggestion.get("key_points", []),
+        )
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        await client.chat_postMessage(
+            channel=settings.it_helpdesk_channel_id,
+            thread_ts=helpdesk_ts,
+            text=":books: KB Article Suggestion",
+            blocks=kb_blocks,
+        )
+    except Exception:
+        logger.debug("Failed to suggest KB article for ticket %s", ticket_id, exc_info=True)
+
+
+async def _generate_kb_suggestion(
+    history: list[dict], ticket_data: dict, settings: Settings,
+) -> dict | None:
+    """Use Gemini to analyze a resolved conversation and suggest a KB article.
+
+    Returns ``{title, key_points, worth_creating}`` or ``None`` on failure.
+    """
+    try:
+        lines = []
+        for msg in history:
+            role = "User" if msg["role"] == "user" else "IT Agent"
+            content = msg["content"]
+            if content.startswith("[System"):
+                content = content.split("]\n\n", 1)[-1] if "]\n\n" in content else content
+            lines.append(f"{role}: {content}")
+        conversation_text = "\n\n".join(lines)
+
+        close_notes = ticket_data.get("close_notes", "")
+
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=(
+                "Analyze this resolved IT support conversation and determine if it would make "
+                "a good knowledge base article. Consider:\n"
+                "- Is this a common issue others might face?\n"
+                "- Was the resolution clearly identified?\n"
+                "- Would documenting the solution save time for future incidents?\n\n"
+                f"Resolution notes: {close_notes}\n\n"
+                f"Conversation:\n{conversation_text[:3000]}\n\n"
+                "Respond with ONLY a JSON object:\n"
+                '{"worth_creating": true/false, "title": "suggested article title", '
+                '"key_points": ["point1", "point2", "point3"]}\n\n'
+                "If not worth creating, set worth_creating to false and leave title/key_points empty."
+            ),
+        )
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            return result
+        return None
+    except Exception:
+        logger.debug("Failed to generate KB suggestion", exc_info=True)
+        return None

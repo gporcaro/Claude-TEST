@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Recommendation approval gate
     recommendation_trust_threshold: int = 5
 
+    # Collaborative review timeout (minutes before falling back to standard approval)
+    collaborative_review_timeout_minutes: int = 30
+
     # SMTP (used by dashboard for MFA)
     smtp_email: str = ""
     smtp_app_password: str = ""

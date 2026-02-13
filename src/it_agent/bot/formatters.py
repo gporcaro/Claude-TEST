@@ -251,6 +251,155 @@ def redact_recommendations(text: str, recommendations: list[dict]) -> str:
     return redacted + placeholder
 
 
+def format_collaborative_review_blocks(
+    review_id: int,
+    trigger_reason: str,
+    original_response: str,
+    user_name: str,
+    ticket_id: str = "",
+    channel_id: str = "",
+) -> list[dict]:
+    """Build Slack blocks for a collaborative review thread-starting message in #it-helpdesk."""
+    # Context line
+    ctx_parts = [f"User: {user_name}"]
+    if ticket_id:
+        ctx_parts.append(f"Ticket: {ticket_id}")
+    if channel_id:
+        ctx_parts.append(f"Channel: <#{channel_id}>")
+
+    # Truncate trigger reason for header (Slack plain_text header max 150 chars)
+    header_text = f":rotating_light: Collaborative Review: {trigger_reason}"
+    if len(header_text) > 150:
+        header_text = header_text[:147] + "..."
+
+    # Truncate response preview to 500 chars
+    preview = original_response[:500]
+    if len(original_response) > 500:
+        preview += "..."
+
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": header_text, "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": " | ".join(ctx_parts)}],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Bot wanted to suggest:* {trigger_reason}\n\n*Response preview:*\n>>>{preview}",
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve & Send"},
+                    "action_id": "collab_approve",
+                    "value": str(review_id),
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Modify & Send"},
+                    "action_id": "collab_modify",
+                    "value": str(review_id),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Take Over"},
+                    "action_id": "collab_takeover",
+                    "value": str(review_id),
+                    "style": "danger",
+                },
+            ],
+        },
+    ]
+
+
+def format_collaborative_context_blocks(
+    original_response: str,
+    issue_summary: str = "",
+) -> list[dict]:
+    """Build Slack blocks for the thread reply with full bot response and context."""
+    # Cap response at 2900 chars for Slack block limit
+    capped = original_response[:2900]
+    if len(original_response) > 2900:
+        capped += "\n_(truncated)_"
+
+    # Blockquote the response
+    quoted = "\n".join(f">{line}" for line in capped.split("\n"))
+
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":clipboard: *Full bot response:*\n{quoted}",
+            },
+        },
+    ]
+
+    if issue_summary:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":speech_balloon: *Context:* {issue_summary}",
+            },
+        })
+
+    return blocks
+
+
+def format_kb_suggestion_blocks(
+    review_id: int,
+    suggested_title: str,
+    key_points: list[str],
+) -> list[dict]:
+    """Build Slack blocks for a KB article suggestion after collaborative review resolution."""
+    points_text = "\n".join(f"- {point}" for point in key_points)
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":books: *KB Article Suggestion*\n"
+                    f"Based on this resolved issue, a KB article could help:\n\n"
+                    f"*Suggested title:* \"{suggested_title}\"\n"
+                    f"*Key points:*\n{points_text}"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Create KB Article"},
+                    "action_id": "collab_create_kb",
+                    "value": str(review_id),
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Dismiss"},
+                    "action_id": "collab_dismiss_kb",
+                    "value": str(review_id),
+                    "style": "danger",
+                },
+            ],
+        },
+    ]
+
+
 def format_debug_blocks(
     source: str,
     user_id: str,

@@ -133,6 +133,27 @@ CREATE TABLE IF NOT EXISTS pending_recommendation_approvals (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS collaborative_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    interaction_id INTEGER,
+    ticket_id TEXT,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT NOT NULL DEFAULT '',
+    user_slack_id TEXT NOT NULL,
+    user_name TEXT NOT NULL DEFAULT '',
+    risk_level TEXT NOT NULL DEFAULT 'high',
+    trigger_reason TEXT NOT NULL DEFAULT '',
+    original_response TEXT NOT NULL,
+    issue_summary TEXT NOT NULL DEFAULT '',
+    helpdesk_message_ts TEXT,
+    placeholder_message_ts TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolved_by TEXT,
+    modified_response TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -545,6 +566,97 @@ async def get_expired_rec_approvals(older_than_minutes: int = 30) -> list[dict]:
         return []
     cursor = await _db.execute(
         """SELECT * FROM pending_recommendation_approvals
+           WHERE status = 'pending'
+             AND created_at <= datetime('now', ?)""",
+        (f"-{older_than_minutes} minutes",),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Collaborative reviews
+# ---------------------------------------------------------------------------
+
+async def create_collaborative_review(
+    *,
+    channel_id: str,
+    thread_ts: str = "",
+    user_slack_id: str,
+    user_name: str = "",
+    original_response: str,
+    trigger_reason: str = "",
+    issue_summary: str = "",
+    risk_level: str = "high",
+    interaction_id: Optional[int] = None,
+    ticket_id: Optional[str] = None,
+    placeholder_message_ts: Optional[str] = None,
+) -> int:
+    """Insert a new collaborative review record. Returns the review id."""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    now = _now_iso()
+    cursor = await _db.execute(
+        """INSERT INTO collaborative_reviews
+           (interaction_id, ticket_id, channel_id, thread_ts,
+            user_slack_id, user_name, risk_level, trigger_reason,
+            original_response, issue_summary, placeholder_message_ts,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            interaction_id, ticket_id, channel_id, thread_ts,
+            user_slack_id, user_name, risk_level, trigger_reason,
+            original_response, issue_summary, placeholder_message_ts,
+            now, now,
+        ),
+    )
+    await _db.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_collaborative_review(review_id: int) -> Optional[dict]:
+    """Fetch a single collaborative review by id."""
+    if _db is None:
+        return None
+    cursor = await _db.execute(
+        "SELECT * FROM collaborative_reviews WHERE id = ?", (review_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def update_collaborative_review(review_id: int, **fields: Any) -> None:
+    """Update arbitrary fields on a collaborative review record."""
+    if _db is None or not fields:
+        return
+    fields["updated_at"] = _now_iso()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [review_id]
+    await _db.execute(
+        f"UPDATE collaborative_reviews SET {set_clause} WHERE id = ?",  # noqa: S608
+        values,
+    )
+    await _db.commit()
+
+
+async def get_collaborative_review_by_ticket(ticket_id: str) -> Optional[dict]:
+    """Fetch the most recent collaborative review for a ticket."""
+    if _db is None:
+        return None
+    cursor = await _db.execute(
+        "SELECT * FROM collaborative_reviews WHERE ticket_id = ? ORDER BY id DESC LIMIT 1",
+        (ticket_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_expired_collaborative_reviews(older_than_minutes: int = 30) -> list[dict]:
+    """Return pending collaborative reviews older than the given threshold."""
+    if _db is None:
+        return []
+    cursor = await _db.execute(
+        """SELECT * FROM collaborative_reviews
            WHERE status = 'pending'
              AND created_at <= datetime('now', ?)""",
         (f"-{older_than_minutes} minutes",),
