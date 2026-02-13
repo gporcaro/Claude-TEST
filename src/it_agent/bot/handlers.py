@@ -921,7 +921,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
     @app.action("move_to_private_channel")
     async def handle_move_to_private_channel(ack, body) -> None:
         await ack()
-        ticket_id = body["actions"][0]["value"]
+        raw_value = body["actions"][0]["value"]
         channel = body["channel"]["id"]
         message_ts = body["message"]["ts"]
         thread_ts = body["message"].get("thread_ts") or message_ts
@@ -929,40 +929,66 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         client = AsyncWebClient(token=settings.slack_bot_token)
 
+        # Parse ticket_id and requester from button value (format: "INC...:U...")
+        if ":" in raw_value:
+            ticket_id, requester_id = raw_value.split(":", 1)
+        else:
+            # Legacy buttons without requester encoded
+            ticket_id = raw_value
+            requester_id = None
+
+        # Only the requester can use this button
+        if requester_id and button_user_id != requester_id:
+            try:
+                clicker_info = await client.users_info(user=button_user_id)
+                clicker_profile = clicker_info["user"]["profile"]
+                first_name = (
+                    clicker_profile.get("first_name")
+                    or clicker_profile.get("display_name", "").split()[0]
+                    or clicker_profile.get("real_name", "").split()[0]
+                    or "there"
+                )
+            except Exception:
+                first_name = "there"
+            try:
+                await client.chat_postEphemeral(
+                    channel=channel,
+                    user=button_user_id,
+                    text=(
+                        f"Hi {first_name}, this button is only for the person "
+                        f"who reported the issue. If you need help, please "
+                        f"start a new thread in this channel."
+                    ),
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.debug("Failed to send requester-only ephemeral", exc_info=True)
+            return
+
         # Check if channel already exists (idempotent)
         for ch_id, ctx in _incident_context.items():
             if ctx.get("ticket_id") == ticket_id:
-                # Ensure the button-clicker is in the channel
+                # Ensure the clicker is in the channel
                 try:
                     await client.conversations_invite(channel=ch_id, users=button_user_id)
                 except Exception:
                     pass  # already_in_channel or other — not critical
-                # Update the button message
+                # Replace button with confirmation + link
                 try:
                     await client.chat_update(
                         channel=channel,
                         ts=message_ts,
-                        text=f":white_check_mark: Private channel <#{ch_id}> already exists for {ticket_id}.",
+                        text=f":white_check_mark: *{ticket_id}* — Head over to <#{ch_id}> to continue.",
                         blocks=[{
                             "type": "section",
                             "text": {
                                 "type": "mrkdwn",
-                                "text": f":white_check_mark: Private channel <#{ch_id}> already exists for {ticket_id}.",
+                                "text": f":white_check_mark: *{ticket_id}* — Head over to <#{ch_id}> to continue.",
                             },
                         }],
                     )
                 except Exception:
                     logger.debug("Failed to update button message", exc_info=True)
-                # Send ephemeral nudge to the user who clicked
-                try:
-                    await client.chat_postEphemeral(
-                        channel=channel,
-                        user=button_user_id,
-                        text=f":arrow_right: Head over to <#{ch_id}> to continue troubleshooting {ticket_id}.",
-                        thread_ts=thread_ts,
-                    )
-                except Exception:
-                    logger.debug("Failed to send ephemeral redirect", exc_info=True)
                 return
 
         # Create the channel
@@ -985,43 +1011,22 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         channel_id = result["channel_id"]
 
-        # Replace the button message with confirmation
+        # Replace the button with confirmation + link (single message, no extras)
         try:
             await client.chat_update(
                 channel=channel,
                 ts=message_ts,
-                text=f":white_check_mark: Private channel <#{channel_id}> has been created for {ticket_id}.",
+                text=f":white_check_mark: *{ticket_id}* — Head over to <#{channel_id}> to continue.",
                 blocks=[{
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f":white_check_mark: Private channel <#{channel_id}> has been created for {ticket_id}.",
+                        "text": f":white_check_mark: *{ticket_id}* — Head over to <#{channel_id}> to continue.",
                     },
                 }],
             )
         except Exception:
             logger.debug("Failed to update button message", exc_info=True)
-
-        # Post in the thread
-        try:
-            await client.chat_postMessage(
-                channel=channel,
-                text=f":arrow_right: A private channel <#{channel_id}> has been created. Further troubleshooting will continue there.",
-                thread_ts=thread_ts,
-            )
-        except Exception:
-            logger.debug("Failed to post channel created thread message", exc_info=True)
-
-        # Send ephemeral nudge to the user who clicked
-        try:
-            await client.chat_postEphemeral(
-                channel=channel,
-                user=button_user_id,
-                text=f":arrow_right: Head over to <#{channel_id}> to continue troubleshooting {ticket_id}.",
-                thread_ts=thread_ts,
-            )
-        except Exception:
-            logger.debug("Failed to send ephemeral redirect", exc_info=True)
 
     # --- Archive channel now action ---
 
@@ -2249,38 +2254,61 @@ async def _handle_help_channel_message(
             ticket_id = ticket.get("ticket_id", "")
 
             if ticket_id:
-                followup_text = (
-                    f":ticket: *Ticket {ticket_id} created.* "
-                    f"The conversation continues here in this thread. "
-                    f"If you need a dedicated private channel, click the button below."
+                # Skip button if a channel was already created (e.g. auto-escalation)
+                already_has_channel = any(
+                    ctx.get("ticket_id") == ticket_id for ctx in _incident_context.values()
                 )
-                followup_text = linkify_servicenow_refs(followup_text, sn_url)
-                followup_blocks = [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": followup_text,
+                if already_has_channel:
+                    # Just post the ticket confirmation without the button
+                    existing_ch = next(
+                        (ch_id for ch_id, ctx in _incident_context.items()
+                         if ctx.get("ticket_id") == ticket_id), None
+                    )
+                    followup_text = (
+                        f":ticket: *Ticket {ticket_id} created.* "
+                        f"A private channel <#{existing_ch}> has been created for this issue."
+                    )
+                    followup_text = linkify_servicenow_refs(followup_text, sn_url)
+                    await say(
+                        text=followup_text,
+                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": followup_text}}],
+                        thread_ts=thread_ts,
+                    )
+                else:
+                    # Encode requester user_id in button value so only they can click
+                    button_value = f"{ticket_id}:{user_id}"
+                    followup_text = (
+                        f":ticket: *Ticket {ticket_id} created.* "
+                        f"The conversation continues here in this thread. "
+                        f"If you need a dedicated private channel, click the button below."
+                    )
+                    followup_text = linkify_servicenow_refs(followup_text, sn_url)
+                    followup_blocks = [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": followup_text,
+                            },
                         },
-                    },
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": "Move to private channel"},
-                                "action_id": "move_to_private_channel",
-                                "value": ticket_id,
-                                "style": "primary",
-                            }
-                        ],
-                    },
-                ]
-                await say(
-                    text=followup_text,
-                    blocks=followup_blocks,
-                    thread_ts=thread_ts,
-                )
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "Move to private channel"},
+                                    "action_id": "move_to_private_channel",
+                                    "value": button_value,
+                                    "style": "primary",
+                                }
+                            ],
+                        },
+                    ]
+                    await say(
+                        text=followup_text,
+                        blocks=followup_blocks,
+                        thread_ts=thread_ts,
+                    )
 
         # Forward thread replies to the incident channel (if one exists)
         if event.get("thread_ts"):
