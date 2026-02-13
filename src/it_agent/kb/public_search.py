@@ -13,7 +13,7 @@ from it_agent.kb.embeddings import embed_texts
 
 logger = logging.getLogger(__name__)
 
-_MIN_SCORE = 0.60
+_MIN_SCORE = 0.70
 
 # Vendor support domains we trust
 VENDOR_DOMAINS = [
