@@ -829,6 +829,18 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 text=linked,
                 blocks=blocks,
             )
+            # Post a thread reply so the user gets a Slack notification
+            thread = approval.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=approval["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":white_check_mark: The troubleshooting steps for this issue "
+                        "have been reviewed and approved by IT. "
+                        "Please see the updated message above."
+                    ),
+                )
         except Exception:
             logger.debug("Failed to update user message on recommendation approval", exc_info=True)
 
@@ -889,6 +901,18 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 text=denial_text,
                 blocks=blocks,
             )
+            # Post a thread reply so the user gets a Slack notification
+            thread = approval.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=approval["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":no_entry: Some troubleshooting steps were reviewed by IT "
+                        "and not approved for this issue. "
+                        "Please reach out to the help desk for further assistance."
+                    ),
+                )
         except Exception:
             logger.debug("Failed to update user message on recommendation denial", exc_info=True)
 
@@ -1192,6 +1216,12 @@ _BASIC_RECOMMENDATIONS = {
     # Windows hardware troubleshooting
     "run sfc", "system file checker", "check disk",
     "boot safe mode windows", "safe mode with networking",
+    # Network safety / isolation advice
+    "disconnect from network", "keep disconnected from network",
+    "disconnect from wifi", "keep laptop disconnected",
+    "disconnect ethernet", "unplug ethernet",
+    "disable wifi", "turn off wifi",
+    "enable airplane mode", "turn on airplane mode",
 }
 
 
