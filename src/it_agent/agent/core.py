@@ -90,6 +90,11 @@ troubleshooting flows, and escalation paths. ALWAYS prioritize information from 
 over general KB search results or your own training knowledge. Use them proactively when the \
 user's question relates to a covered topic — do not search the KB for topics already covered \
 by an [AI Context] article.
+- **Software policy**: The company does NOT allow installation of unapproved third-party software, \
+browser extensions, or plugins. NEVER recommend installing Chrome extensions (e.g., "The Great \
+Suspender", "OneTab", tab managers), third-party utilities, or any software not explicitly listed \
+as approved in the knowledge base. Instead, recommend built-in OS or browser features only \
+(e.g., Chrome's built-in Memory Saver, Activity Monitor, Task Manager).
 - **Admin-side checks**: Never ask the user to verify things they cannot check or do not have \
 access to. Okta group memberships, Active Directory groups, license assignments, SSO \
 configurations, firewall rules, and application provisioning are all IT-managed. If access \
@@ -135,6 +140,13 @@ escalated the ticket to high priority. IT staff have been notified in #it-helpde
 join this channel to assist you." Do NOT promise someone will "reach out" or "contact you in \
 a private channel" — they are already in the channel.
 
+- **Casual gratitude is NOT a resolution signal.** Messages like "thank you", "thanks", "ty", \
+"appreciate it", "thanks for the help" are polite acknowledgements — they do NOT mean the \
+issue is resolved. When you receive only gratitude, respond warmly (e.g., "You're welcome! \
+Let me know if the issue persists or if there's anything else I can help with.") and do NOT \
+resolve or close the ticket. Only treat a message as a resolution confirmation when the user \
+explicitly states the issue is fixed (e.g., "that worked", "all good now", "problem solved", \
+"it's working", "that would be all", "issue is resolved").
 - When the user confirms the issue is resolved (e.g., "that worked", "all good", "this helped", \
 "that would be all"), **do NOT immediately resolve the ticket**. First, carefully analyze the \
 user's message and the conversation history to determine if the resolution reason has already \
@@ -145,6 +157,24 @@ immediately without asking again. Only ask "Could you briefly share what resolve
 if the resolution cause is genuinely unclear (e.g., the user just says "it's working now" \
 with no explanation). If the user declines or is unsure, resolve with a brief summary from \
 conversation context.
+"""
+
+REFINEMENT_SYSTEM_PROMPT = """\
+You are an IT Support writing assistant. An IT helpdesk engineer is collaborating \
+with you to refine a response that will be sent to an employee.
+
+Your role:
+- Take direction from the engineer on how to rewrite or adjust the response.
+- If the engineer provides a full replacement, adopt it verbatim.
+- If the engineer gives partial instructions (e.g., "rewrite step 3 to mention X"), \
+apply the change and return the full updated response.
+- If the engineer asks to switch to escalation language, rewrite the response to \
+recommend contacting IT support instead of providing self-service steps.
+- Keep the tone professional, concise, and suitable for Slack (use *bold*, `code`, \
+bullet points).
+- Do NOT add information you are unsure about. If the engineer's instruction is \
+unclear, ask for clarification.
+- Always output the complete revised response text — not a diff or summary of changes.
 """
 
 # Build Gemini function declarations from our TOOLS list at module level.
@@ -185,6 +215,7 @@ class Agent:
         messages: list[dict],
         user_id: str = "unknown",
         context_articles: list[dict] | None = None,
+        system_prompt: str | None = None,
     ) -> AgentResult:
         """Run the agent tool loop and return a structured AgentResult."""
         await emit("agent_start", {"user_id": user_id, "message_count": len(messages)})
@@ -198,14 +229,15 @@ class Agent:
             )
 
         # Build system prompt, injecting [AI Context] articles when available.
-        system_prompt = SYSTEM_PROMPT
-        if context_articles:
+        effective_prompt = system_prompt or SYSTEM_PROMPT
+        use_tools = system_prompt is None  # disable tools for prompt overrides
+        if context_articles and not system_prompt:
             sections = []
             for art in context_articles:
                 sections.append(
                     f"### {art['title']} ({art['id']})\n{art['content']}"
                 )
-            system_prompt += (
+            effective_prompt += (
                 "\n\n---\n## Authoritative AI Context Articles\n"
                 "The following articles are curated by IT staff. "
                 "Treat them as your primary source of truth.\n\n"
@@ -213,8 +245,8 @@ class Agent:
             )
 
         config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            tools=GEMINI_TOOLS,
+            system_instruction=effective_prompt,
+            tools=GEMINI_TOOLS if use_tools else [],
         )
 
         all_tool_calls: list[dict] = []

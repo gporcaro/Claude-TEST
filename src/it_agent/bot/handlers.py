@@ -12,7 +12,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
 from it_agent.agent import executor
-from it_agent.agent.core import Agent, AgentResult
+from it_agent.agent.core import Agent, AgentResult, REFINEMENT_SYSTEM_PROMPT
 from it_agent.bot.events import emit
 from it_agent.bot.formatters import (
     format_approval_blocks,
@@ -23,6 +23,8 @@ from it_agent.bot.formatters import (
     format_kb_suggestion_blocks,
     format_public_article_blocks,
     format_recommendation_approval_blocks,
+    format_refinement_context_blocks,
+    format_refinement_send_button,
     format_response_blocks,
     linkify_servicenow_refs,
     redact_recommendations,
@@ -81,6 +83,9 @@ _ai_context_articles: dict[str, dict] = {}
 
 # Debug channel ID resolved at startup (None = not found / disabled)
 _debug_channel_id: str | None = None
+
+# Active refinement threads: (helpdesk_channel, approval_message_ts) → approval_id
+_active_refinements: dict[tuple[str, str], int] = {}
 
 
 async def load_ai_context_articles(settings: Settings) -> None:
@@ -649,6 +654,17 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             await _handle_incident_message(event, text, say, settings)
             return
 
+        # Refinement threads in #it-helpdesk
+        thread_ts = event.get("thread_ts", "")
+        if (
+            settings.it_helpdesk_channel_id
+            and channel == settings.it_helpdesk_channel_id
+            and thread_ts
+            and (channel, thread_ts) in _active_refinements
+        ):
+            await _handle_refinement_message(event, text, settings)
+            return
+
         # Other channels → ignore (handled by app_mention only)
 
     # Wire the resolution callback
@@ -791,6 +807,48 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
     # --- Recommendation approval actions ---
 
+    async def _build_rec_decision_line(
+        emoji: str, action: str, actor_name: str,
+        rec_ids: list[int], approval: dict, settings: Settings,
+    ) -> str:
+        """Build a single-line summary for #it-helpdesk after approve/deny.
+
+        Format: <emoji> Recommendations <action> by <actor> — <short summary> | <link>
+        """
+        # Build short summary from recommendation canonical forms
+        summaries: list[str] = []
+        for rid in rec_ids:
+            rec = await db.get_recommendation(rid)
+            if rec:
+                summaries.append(rec["canonical_form"])
+        summary_text = ", ".join(summaries) if summaries else "N/A"
+        # Truncate if too long
+        if len(summary_text) > 120:
+            summary_text = summary_text[:117] + "..."
+
+        # Build permalink to the original thread/channel
+        link_text = ""
+        conv_channel = approval.get("channel_id", "")
+        conv_thread = approval.get("thread_ts", "")
+        if conv_channel:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                msg_ts = conv_thread or approval.get("message_ts", "")
+                if msg_ts:
+                    link_resp = await client.chat_getPermalink(
+                        channel=conv_channel, message_ts=msg_ts,
+                    )
+                    permalink = link_resp.get("permalink", "")
+                    if permalink:
+                        link_text = f" | <{permalink}|View thread>"
+            except Exception:
+                logger.debug("Failed to get permalink for rec decision line", exc_info=True)
+
+        return (
+            f"{emoji} Recommendations {action} by {actor_name}"
+            f" — _{summary_text}_{link_text}"
+        )
+
     @app.action("approve_recommendation")
     async def handle_approve_recommendation(ack, body) -> None:
         await ack()
@@ -847,21 +905,22 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to update user message on recommendation approval", exc_info=True)
 
-        # Update the #it-helpdesk approval message
+        # Update the #it-helpdesk approval message with summary + link
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             ch = approval.get("approval_channel") or body["channel"]["id"]
             ts = approval.get("approval_message_ts") or body["message"]["ts"]
+            summary_line = await _build_rec_decision_line(
+                ":white_check_mark:", "approved", approver_name,
+                rec_ids, approval, settings,
+            )
             await client.chat_update(
                 channel=ch,
                 ts=ts,
-                text=f":white_check_mark: Recommendations approved by {approver_name}",
+                text=summary_line,
                 blocks=[{
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":white_check_mark: Recommendations approved by {approver_name}",
-                    },
+                    "text": {"type": "mrkdwn", "text": summary_line},
                 }],
             )
         except Exception:
@@ -919,21 +978,22 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to update user message on recommendation denial", exc_info=True)
 
-        # Update the #it-helpdesk message
+        # Update the #it-helpdesk message with summary + link
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             ch = approval.get("approval_channel") or body["channel"]["id"]
             ts = approval.get("approval_message_ts") or body["message"]["ts"]
+            summary_line = await _build_rec_decision_line(
+                ":no_entry:", "denied", denier_name,
+                rec_ids, approval, settings,
+            )
             await client.chat_update(
                 channel=ch,
                 ts=ts,
-                text=f":no_entry: Recommendations denied by {denier_name}",
+                text=summary_line,
                 blocks=[{
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":no_entry: Recommendations denied by {denier_name}",
-                    },
+                    "text": {"type": "mrkdwn", "text": summary_line},
                 }],
             )
         except Exception:
@@ -943,7 +1003,293 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             "approval_id": approval_id, "denier": denier_name,
         })
 
+    # --- Recommendation refinement actions ---
+
+    @app.action("refine_recommendation")
+    async def handle_refine_recommendation(ack, body) -> None:
+        await ack()
+        approval_id = int(body["actions"][0]["value"])
+        refiner_id = body["user"]["id"]
+        refiner_name = await _resolve_user_name(refiner_id, settings)
+
+        approval = await db.get_pending_rec_approval(approval_id)
+        if not approval or approval["status"] != "pending":
+            return
+
+        await db.update_pending_rec_approval(approval_id, status="refining")
+
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        ch = approval.get("approval_channel") or body["channel"]["id"]
+        ts = approval.get("approval_message_ts") or body["message"]["ts"]
+
+        # Replace the buttons with a "Refinement in progress..." message
+        try:
+            rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+            rec_lines_parts: list[str] = []
+            for rid in rec_ids:
+                rec = await db.get_recommendation(rid)
+                if rec:
+                    rec_lines_parts.append(
+                        f"• `{rec['canonical_form']}` ({rec.get('category', 'general')})"
+                    )
+            rec_lines = "\n".join(rec_lines_parts)
+            preview = approval["original_text"][:500]
+            if len(approval["original_text"]) > 500:
+                preview += "..."
+
+            status_text = (
+                f":mag: *Recommendation approval needed*\n\n"
+                f"*User:* {approval.get('user_name', 'unknown')}\n\n"
+                f"*Recommendations requiring approval:*\n{rec_lines}\n\n"
+                f"*Response preview:*\n>>>{preview}\n\n"
+                f":pencil2: _Refinement in progress by {refiner_name}..._"
+            )
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=status_text,
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": status_text},
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update approval message for refinement", exc_info=True)
+
+        # Post thread reply with refinement context
+        try:
+            rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+            recommendations: list[dict] = []
+            for rid in rec_ids:
+                rec = await db.get_recommendation(rid)
+                if rec:
+                    recommendations.append(rec)
+
+            # Try to get user issue summary from conversation history
+            conv_key = (approval["channel_id"], approval.get("thread_ts", ""))
+            conv = _conversations.get(conv_key, [])
+            issue_summary = ""
+            for msg in conv:
+                if msg["role"] == "user":
+                    issue_summary = msg["content"][:300]
+                    break
+
+            context_blocks = format_refinement_context_blocks(
+                original_text=approval["original_text"],
+                recommendations=recommendations,
+                issue_summary=issue_summary,
+            )
+            await client.chat_postMessage(
+                channel=ch,
+                thread_ts=ts,
+                text="Refinement context",
+                blocks=context_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to post refinement context thread", exc_info=True)
+
+        # Register the refinement thread and seed conversation context
+        _active_refinements[(ch, ts)] = approval_id
+        refinement_key = (ch, ts)
+        _conversations[refinement_key] = [
+            {
+                "role": "assistant",
+                "content": (
+                    f"Here is the original response that needs refinement:\n\n"
+                    f"{approval['original_text']}\n\n"
+                    f"I'm ready to help you refine this response. "
+                    f"What changes would you like to make?"
+                ),
+            },
+        ]
+
+        await emit("recommendation_refine_started", {
+            "approval_id": approval_id, "refiner": refiner_name,
+        })
+
+    async def _handle_refinement_message(
+        event: dict, text: str, settings: Settings,
+    ) -> None:
+        """Handle a message in a refinement thread — run the agent with REFINEMENT_SYSTEM_PROMPT."""
+        channel = event.get("channel", "")
+        thread_ts = event.get("thread_ts", "")
+        key = (channel, thread_ts)
+
+        approval_id = _active_refinements.get(key)
+        if approval_id is None:
+            return
+
+        # Append engineer's message to conversation
+        conv = _conversations.setdefault(key, [])
+        conv.append({"role": "user", "content": text})
+
+        # Run the agent with the refinement system prompt (no tools)
+        agent = _get_agent(settings)
+        try:
+            result = await agent.run(
+                messages=conv,
+                system_prompt=REFINEMENT_SYSTEM_PROMPT,
+            )
+        except Exception:
+            logger.warning("Refinement agent call failed", exc_info=True)
+            return
+
+        # Store the refined text
+        conv.append({"role": "assistant", "content": result.text})
+        await db.update_pending_rec_approval(approval_id, refined_text=result.text)
+
+        # Post the response + Send/Continue buttons in thread
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        try:
+            response_blocks = format_response_blocks(result.text, settings.sn_instance_url)
+            send_blocks = format_refinement_send_button(approval_id)
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=result.text,
+                blocks=response_blocks + send_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to post refinement response", exc_info=True)
+
+    @app.action("send_refined_recommendation")
+    async def handle_send_refined_recommendation(ack, body) -> None:
+        await ack()
+        approval_id = int(body["actions"][0]["value"])
+        sender_id = body["user"]["id"]
+        sender_name = await _resolve_user_name(sender_id, settings)
+
+        approval = await db.get_pending_rec_approval(approval_id)
+        if not approval or approval["status"] != "refining":
+            return
+
+        refined_text = approval.get("refined_text")
+        if not refined_text:
+            return
+
+        await db.update_pending_rec_approval(approval_id, status="approved")
+
+        # Increment approval counts (refined = acceptable)
+        rec_ids = json.loads(approval.get("recommendation_ids", "[]"))
+        for rec_id in rec_ids:
+            updated_rec = await db.increment_recommendation_approval(rec_id)
+            if (
+                updated_rec
+                and updated_rec["status"] != "trusted"
+                and updated_rec["approval_count"] >= settings.recommendation_trust_threshold
+            ):
+                await db.update_recommendation(rec_id, status="trusted")
+
+        # Replace the user's redacted message with the refined response
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            sn_url = settings.sn_instance_url
+            linked = linkify_servicenow_refs(refined_text, sn_url)
+            blocks = format_response_blocks(refined_text, sn_url)
+            await client.chat_update(
+                channel=approval["channel_id"],
+                ts=approval["message_ts"],
+                text=linked,
+                blocks=blocks,
+            )
+            # Post thread notification to the user
+            thread = approval.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=approval["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":pencil2: The troubleshooting steps for this issue "
+                        "have been reviewed, refined, and approved by IT. "
+                        "Please see the updated message above."
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to update user message with refined recommendation", exc_info=True)
+
+        # Update the #it-helpdesk approval message with summary
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            ch = approval.get("approval_channel") or body["channel"]["id"]
+            ts = approval.get("approval_message_ts") or body["message"]["ts"]
+            summary_line = await _build_rec_decision_line(
+                ":pencil2:", "refined and sent", sender_name,
+                rec_ids, approval, settings,
+            )
+            await client.chat_update(
+                channel=ch,
+                ts=ts,
+                text=summary_line,
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": summary_line},
+                }],
+            )
+        except Exception:
+            logger.debug("Failed to update refined recommendation approval message", exc_info=True)
+
+        # Clean up tracking state
+        for key, aid in list(_active_refinements.items()):
+            if aid == approval_id:
+                _active_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
+
+        await emit("recommendation_refined", {
+            "approval_id": approval_id, "sender": sender_name,
+        })
+
+    @app.action("continue_refining")
+    async def handle_continue_refining(ack, body) -> None:
+        await ack()
+        # Dismiss the Send/Continue buttons by updating the message to remove them
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            msg = body.get("message", {})
+            # Keep only the text blocks, remove the actions block
+            original_blocks = msg.get("blocks", [])
+            text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=msg["ts"],
+                text=msg.get("text", ""),
+                blocks=text_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to dismiss continue refining buttons", exc_info=True)
+
     # --- Collaborative review actions ---
+
+    async def _build_collab_decision_line(
+        emoji: str, action: str, actor_name: str,
+        review: dict, settings: Settings,
+    ) -> str:
+        """Build a single-line summary for #it-helpdesk after collab approve/modify/takeover."""
+        summary_text = review.get("issue_summary", "") or review.get("ticket_id", "")
+        if len(summary_text) > 120:
+            summary_text = summary_text[:117] + "..."
+
+        link_text = ""
+        conv_channel = review.get("channel_id", "")
+        conv_thread = review.get("thread_ts", "")
+        if conv_channel:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                msg_ts = conv_thread or review.get("placeholder_message_ts", "")
+                if msg_ts:
+                    link_resp = await client.chat_getPermalink(
+                        channel=conv_channel, message_ts=msg_ts,
+                    )
+                    permalink = link_resp.get("permalink", "")
+                    if permalink:
+                        link_text = f" | <{permalink}|View thread>"
+            except Exception:
+                logger.debug("Failed to get permalink for collab decision line", exc_info=True)
+
+        return (
+            f"{emoji} Collaborative review {action} by {actor_name}"
+            f" — _{summary_text}_{link_text}"
+        )
 
     @app.action("collab_approve")
     async def handle_collab_approve(ack, body) -> None:
@@ -987,22 +1333,17 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to update user message on collab approve", exc_info=True)
 
-        # Update the #it-helpdesk message
+        # Update the #it-helpdesk message with summary + link
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             ch = body["channel"]["id"]
             ts = body["message"]["ts"]
+            summary_line = await _build_collab_decision_line(
+                ":white_check_mark:", "approved", approver_name, review, settings,
+            )
             await client.chat_update(
-                channel=ch,
-                ts=ts,
-                text=f":white_check_mark: Collaborative review approved by {approver_name}",
-                blocks=[{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":white_check_mark: Collaborative review approved by {approver_name}",
-                    },
-                }],
+                channel=ch, ts=ts, text=summary_line,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_line}}],
             )
         except Exception:
             logger.debug("Failed to update collab approval message", exc_info=True)
@@ -1099,22 +1440,18 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to update user message on collab modify", exc_info=True)
 
-        # Update #it-helpdesk message
+        # Update #it-helpdesk message with summary + link
         helpdesk_ts = review.get("helpdesk_message_ts")
         if helpdesk_ts and settings.it_helpdesk_channel_id:
             try:
                 client = AsyncWebClient(token=settings.slack_bot_token)
+                summary_line = await _build_collab_decision_line(
+                    ":pencil2:", "modified and sent", modifier_name, review, settings,
+                )
                 await client.chat_update(
                     channel=settings.it_helpdesk_channel_id,
-                    ts=helpdesk_ts,
-                    text=f":pencil2: Collaborative review modified and sent by {modifier_name}",
-                    blocks=[{
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f":pencil2: Collaborative review modified and sent by {modifier_name}",
-                        },
-                    }],
+                    ts=helpdesk_ts, text=summary_line,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_line}}],
                 )
             except Exception:
                 logger.debug("Failed to update collab modify helpdesk message", exc_info=True)
@@ -1181,22 +1518,17 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         except Exception:
             logger.debug("Failed to update user message on collab takeover", exc_info=True)
 
-        # Update the #it-helpdesk message
+        # Update the #it-helpdesk message with summary + link
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             ch = body["channel"]["id"]
             ts = body["message"]["ts"]
+            summary_line = await _build_collab_decision_line(
+                ":bust_in_silhouette:", "taken over", takeover_name, review, settings,
+            )
             await client.chat_update(
-                channel=ch,
-                ts=ts,
-                text=f":bust_in_silhouette: Collaborative review taken over by {takeover_name}",
-                blocks=[{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":bust_in_silhouette: Collaborative review taken over by {takeover_name}",
-                    },
-                }],
+                channel=ch, ts=ts, text=summary_line,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_line}}],
             )
         except Exception:
             logger.debug("Failed to update collab takeover message", exc_info=True)
@@ -1590,7 +1922,13 @@ async def _extract_recommendations(
                 'flag with category "core_app_violation". This must NEVER reach users without '
                 "IT review.\n\n"
                 "For each recommendation found, output a JSON array of objects with:\n"
-                '- "original_text": the exact text span from the response\n'
+                '- "original_text": the COMPLETE text block from the response for this '
+                "recommendation. This must include the ENTIRE numbered step or bullet point "
+                "AND all of its sub-bullets, sub-steps, and continuation lines — from the "
+                "step number/bullet through to just before the next top-level step or section. "
+                "Copy the text EXACTLY as it appears, preserving all formatting, newlines, "
+                "and sub-items. Do NOT extract just a phrase or single line — extract the "
+                "whole block.\n"
                 '- "canonical_form": a short normalized version (e.g. "disable hardware acceleration in Chrome")\n'
                 '- "category": one of "settings_change", "install", "command", "config_change", '
                 '"feature_toggle", "core_app_violation"\n\n'
@@ -2066,52 +2404,77 @@ def _schedule_live_summary(ticket_id: str, settings: Settings) -> None:
         existing.cancel()
 
     async def _delayed():
-        await asyncio.sleep(_SUMMARY_DEBOUNCE_SECONDS)
-        await _push_live_summary(ticket_id, settings)
-        _summary_timers.pop(ticket_id, None)
+        try:
+            await asyncio.sleep(_SUMMARY_DEBOUNCE_SECONDS)
+            await _push_live_summary(ticket_id, settings)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Live summary push failed for %s", ticket_id)
+        finally:
+            _summary_timers.pop(ticket_id, None)
 
     _summary_timers[ticket_id] = asyncio.create_task(_delayed())
 
 
+def _push_live_summary_now(ticket_id: str, settings: Settings) -> None:
+    """Push live summary immediately (fire-and-forget). Also resets the
+    debounce timer so we don't double-push shortly after."""
+    # Cancel any pending debounced push
+    existing = _summary_timers.pop(ticket_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+
+    async def _immediate():
+        try:
+            await _push_live_summary(ticket_id, settings)
+        except Exception:
+            logger.exception("Immediate live summary push failed for %s", ticket_id)
+
+    asyncio.create_task(_immediate())
+
+
 async def _push_live_summary(ticket_id: str, settings: Settings) -> None:
     """Generate an AI summary of all conversations for this ticket and
-    write it into the ServiceNow description field."""
+    append it to the ServiceNow description field (below the original text,
+    separated by 3 blank lines).  Each push replaces the previous summary."""
+    logger.info("Starting live summary push for %s", ticket_id)
+
     # 1. Collect conversation history from both thread and channel
     history = _collect_ticket_history(ticket_id)
     if not history:
+        logger.info("No conversation history found for %s, skipping summary", ticket_id)
         return
 
     # 2. Generate summary via Gemini
     summary = await _summarize_conversation(history, settings)
 
-    # 3. Build updated description: original + separator + summary
+    # 3. Build updated description: original + 3 blank lines + summary
+    _SUMMARY_SEPARATOR = "\n\n\n\n--- LIVE SUMMARY (auto-updated) ---\n"
+
     original = _ticket_original_descriptions.get(ticket_id, "")
-    if not original:
-        # Fetch from SN as fallback
-        sn = ServiceNowClient(settings.sn_instance_url, settings.sn_username, settings.sn_password)
-        try:
-            incident = await sn.get_incident(ticket_id)
-            if incident:
-                desc = incident.get("description", "")
-                # Strip any previous live summary
-                original = desc.split("\n---------------------------------------------------\n")[0].rstrip()
-        finally:
-            await sn.close()
-
-    separator = "\n\n---------------------------------------------------\n\n"
-    new_description = f"{original}{separator}**Live Summary (auto-updated):**\n{summary}"
-
-    # 4. Update ServiceNow
     sn = ServiceNowClient(settings.sn_instance_url, settings.sn_username, settings.sn_password)
     try:
         incident = await sn.get_incident(ticket_id)
-        if incident:
-            await sn.update_incident(
-                incident["sys_id"],
-                {"description": new_description},
-                current_state=incident.get("_raw_state", "1"),
-            )
-            logger.info("Pushed live summary to SN for %s", ticket_id)
+        if not incident:
+            logger.warning("Incident %s not found in SN, skipping summary push", ticket_id)
+            return
+
+        # If we don't have the original cached, recover it from SN
+        if not original:
+            desc = incident.get("description", "")
+            # Strip any previous live summary to get clean original text
+            original = desc.split("--- LIVE SUMMARY")[0].rstrip()
+            _ticket_original_descriptions[ticket_id] = original
+
+        new_description = f"{original}{_SUMMARY_SEPARATOR}{summary}"
+
+        await sn.update_incident(
+            incident["sys_id"],
+            {"description": new_description},
+            current_state=incident.get("_raw_state", "1"),
+        )
+        logger.info("Pushed live summary to SN description for %s", ticket_id)
     finally:
         await sn.close()
 
@@ -2277,11 +2640,11 @@ async def _handle_incident_message(
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
 
-        # Schedule debounced live summary push to ServiceNow
+        # Push live summary to ServiceNow immediately after each agent response
         ctx = _incident_context.get(channel, {})
         inc_ticket_id = ctx.get("ticket_id")
         if inc_ticket_id:
-            _schedule_live_summary(inc_ticket_id, settings)
+            _push_live_summary_now(inc_ticket_id, settings)
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, None, settings)
@@ -2969,14 +3332,14 @@ async def _handle_help_channel_message(
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
 
-        # Schedule debounced live summary push to ServiceNow
+        # Push live summary to ServiceNow immediately after each agent response
         help_ticket_id: str | None = None
         for tid, (ch, ts) in _ticket_threads.items():
             if ch == channel and ts == thread_ts:
                 help_ticket_id = tid
                 break
         if help_ticket_id:
-            _schedule_live_summary(help_ticket_id, settings)
+            _push_live_summary_now(help_ticket_id, settings)
 
     except Exception as exc:
         logger.exception("Error processing #help-it message")
@@ -3484,24 +3847,22 @@ async def _process_expired_rec_approvals(settings: Settings) -> None:
                 approval_id, exc_info=True,
             )
 
-        # Update the #it-helpdesk message
+        # Update the #it-helpdesk message with summary + link
         msg_ts = approval.get("approval_message_ts")
         ch = approval.get("approval_channel")
         if msg_ts and ch:
             try:
+                summary_line = await _build_rec_decision_line(
+                    ":hourglass:", f"auto-denied (timed out after {_APPROVAL_TIMEOUT_MINUTES}min)",
+                    "system", rec_ids, approval, settings,
+                )
                 await client.chat_update(
                     channel=ch,
                     ts=msg_ts,
-                    text=f":hourglass: Recommendations auto-denied (timed out after {_APPROVAL_TIMEOUT_MINUTES}min)",
+                    text=summary_line,
                     blocks=[{
                         "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f":hourglass: Recommendations auto-denied "
-                                f"(timed out after {_APPROVAL_TIMEOUT_MINUTES}min)"
-                            ),
-                        },
+                        "text": {"type": "mrkdwn", "text": summary_line},
                     }],
                 )
             except Exception:
@@ -3633,24 +3994,18 @@ async def _process_expired_collaborative_reviews(settings: Settings) -> None:
                 except Exception:
                     logger.debug("Failed to update placeholder for review %d", review_id, exc_info=True)
 
-        # Update the #it-helpdesk message
+        # Update the #it-helpdesk message with summary + link
         helpdesk_ts = review.get("helpdesk_message_ts")
         if helpdesk_ts and settings.it_helpdesk_channel_id:
             try:
+                summary_line = await _build_collab_decision_line(
+                    ":hourglass:", f"timed out after {timeout}min — fell back to standard approval",
+                    "system", review, settings,
+                )
                 await client.chat_update(
                     channel=settings.it_helpdesk_channel_id,
-                    ts=helpdesk_ts,
-                    text=f":hourglass: Collaborative review timed out — fell back to standard approval",
-                    blocks=[{
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f":hourglass: Collaborative review timed out after "
-                                f"{timeout}min — fell back to standard approval"
-                            ),
-                        },
-                    }],
+                    ts=helpdesk_ts, text=summary_line,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_line}}],
                 )
             except Exception:
                 logger.debug(

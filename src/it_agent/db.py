@@ -168,6 +168,16 @@ async def init_db(db_path: str) -> None:
     _db.row_factory = aiosqlite.Row
     await _db.executescript(_SCHEMA)
     await _db.commit()
+
+    # Idempotent migration: add refined_text column for recommendation refinement
+    try:
+        await _db.execute(
+            "ALTER TABLE pending_recommendation_approvals ADD COLUMN refined_text TEXT"
+        )
+        await _db.commit()
+    except Exception:
+        pass  # Column already exists
+
     logger.info("Interactions database initialized at %s", db_path)
 
 

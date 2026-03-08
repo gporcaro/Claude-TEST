@@ -213,6 +213,12 @@ def format_recommendation_approval_blocks(
                 },
                 {
                     "type": "button",
+                    "text": {"type": "plain_text", "text": "Refine"},
+                    "action_id": "refine_recommendation",
+                    "value": str(approval_id),
+                },
+                {
+                    "type": "button",
                     "text": {"type": "plain_text", "text": "Deny"},
                     "action_id": "deny_recommendation",
                     "value": str(approval_id),
@@ -223,17 +229,172 @@ def format_recommendation_approval_blocks(
     ]
 
 
+def format_refinement_context_blocks(
+    original_text: str,
+    recommendations: list[dict],
+    issue_summary: str = "",
+) -> list[dict]:
+    """Build Slack blocks for the opening thread reply in a refinement conversation.
+
+    Shows the original response (blockquoted), flagged recommendations, and instructions.
+    """
+    # Cap and blockquote the original response
+    capped = original_text[:2900]
+    if len(original_text) > 2900:
+        capped += "\n_(truncated)_"
+    quoted = "\n".join(f">{line}" for line in capped.split("\n"))
+
+    rec_lines = "\n".join(
+        f"• `{r['canonical_form']}` ({r.get('category', 'general')})"
+        for r in recommendations
+    )
+
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":clipboard: *Original response:*\n{quoted}",
+            },
+        },
+    ]
+
+    if rec_lines:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":warning: *Flagged recommendations:*\n{rec_lines}",
+            },
+        })
+
+    if issue_summary:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":speech_balloon: *User's issue:* {issue_summary}",
+            },
+        })
+
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                ":pencil2: *Reply in this thread* with instructions to refine "
+                "the response (e.g., \"rewrite step 3 to recommend checking "
+                "with IT first\"). The bot will revise the text for your review."
+            ),
+        },
+    })
+
+    return blocks
+
+
+def format_refinement_send_button(approval_id: int) -> list[dict]:
+    """Build Slack blocks with Send to User / Continue Refining buttons."""
+    return [
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Send to User"},
+                    "action_id": "send_refined_recommendation",
+                    "value": str(approval_id),
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Continue Refining"},
+                    "action_id": "continue_refining",
+                    "value": str(approval_id),
+                },
+            ],
+        },
+    ]
+
+
+def _expand_to_block(text: str, span: str) -> str:
+    """Expand a short span to its containing numbered step or bullet block.
+
+    If ``span`` is already a multi-line block, return it as-is.
+    Otherwise, find the numbered step (e.g. ``2. ...``) or bullet (``- ...``, ``* ...``)
+    that contains ``span`` and return the entire block including sub-items.
+    """
+    # If span already covers multiple lines, trust it
+    if span.count("\n") >= 2:
+        return span
+
+    idx = text.find(span)
+    if idx == -1:
+        return span
+
+    lines = text.split("\n")
+
+    # Find which line the span starts on
+    char_count = 0
+    span_line_idx = 0
+    for i, line in enumerate(lines):
+        # +1 accounts for the newline character
+        if char_count + len(line) >= idx:
+            span_line_idx = i
+            break
+        char_count += len(line) + 1
+
+    # Walk backwards to find the top-level step/bullet that owns this line
+    top_level_pattern = re.compile(r"^\s{0,1}(\d+[\.\)]\s|[\*\-]\s\*?\*?)")
+    block_start = span_line_idx
+    for i in range(span_line_idx, -1, -1):
+        if top_level_pattern.match(lines[i]):
+            block_start = i
+            break
+
+    # Walk forward to find where the next top-level step/bullet starts
+    block_end = len(lines) - 1
+    for i in range(block_start + 1, len(lines)):
+        if top_level_pattern.match(lines[i]):
+            block_end = i - 1
+            break
+
+    # Trim trailing empty lines from the block
+    while block_end > block_start and not lines[block_end].strip():
+        block_end -= 1
+
+    return "\n".join(lines[block_start : block_end + 1])
+
+
 def redact_recommendations(text: str, recommendations: list[dict]) -> str:
     """Remove recommendation text spans from the response and append a placeholder.
 
     Each recommendation dict should have an ``original_text`` key with the
-    exact span to remove from the response.
+    exact span to remove from the response.  When the span is too short
+    (a single phrase rather than a full block), it is expanded to the
+    containing numbered step or bullet group so the redacted version is
+    meaningfully different from the original.
     """
     redacted = text
     for rec in recommendations:
         span = rec.get("original_text", "")
-        if span and span in redacted:
-            redacted = redacted.replace(span, "")
+        if not span:
+            continue
+
+        if span in redacted:
+            # Expand short spans to their full containing block
+            expanded = _expand_to_block(redacted, span)
+            if expanded in redacted:
+                redacted = redacted.replace(expanded, "", 1)
+            else:
+                redacted = redacted.replace(span, "", 1)
+        else:
+            # Span doesn't match exactly — try to find and remove the block
+            # by matching the first meaningful line of the span
+            first_line = span.split("\n")[0].strip()
+            if first_line and first_line in redacted:
+                expanded = _expand_to_block(redacted, first_line)
+                if expanded in redacted:
+                    redacted = redacted.replace(expanded, "", 1)
 
     # Clean up orphaned numbered list items (e.g. "2.  \n" left after redaction)
     redacted = re.sub(r"^\s*\d+\.\s*$", "", redacted, flags=re.MULTILINE)
