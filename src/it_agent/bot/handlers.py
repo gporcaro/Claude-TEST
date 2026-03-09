@@ -33,7 +33,7 @@ from it_agent.config import Settings
 from it_agent import db
 from it_agent.servicenow.client import ServiceNowClient
 from it_agent.kb.indexer import _strip_html
-from it_agent.tools.tickets import create_incident_channel, create_ticket as _create_ticket_tool, get_ticket
+from it_agent.tools.tickets import create_incident_channel, create_ticket as _create_ticket_tool, get_ticket, update_ticket
 from it_agent.tools.users import resolve_sn_user_to_slack
 
 logger = logging.getLogger(__name__)
@@ -948,13 +948,31 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         for rec_id in rec_ids:
             await db.increment_recommendation_denial(rec_id)
 
-        # Update the user's message with denial notice
+        # Escalate the ticket to high priority
+        escalated_ticket_id = ""
+        interaction_id = approval.get("interaction_id")
+        if interaction_id:
+            try:
+                interaction = await db.get_interaction(interaction_id)
+                if interaction and interaction.get("ticket_id"):
+                    escalated_ticket_id = interaction["ticket_id"]
+                    await update_ticket(
+                        escalated_ticket_id,
+                        priority="high",
+                        comment="Recommendation denied by IT review — escalating for agent follow-up.",
+                        _settings=settings,
+                    )
+                    logger.info("Escalated ticket %s after recommendation denial", escalated_ticket_id)
+            except Exception:
+                logger.debug("Failed to escalate ticket on recommendation denial", exc_info=True)
+
+        # Update the user's message with escalation notice
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             denial_text = (
                 f"{approval['redacted_text'].rsplit(':hourglass_flowing_sand:', 1)[0].rstrip()}"
-                "\n\n:no_entry: _The specific troubleshooting steps were reviewed and not approved by IT. "
-                "Please contact the help desk for further assistance._"
+                "\n\n:rotating_light: _The troubleshooting steps have been reviewed by IT. "
+                "This issue has been escalated and a Support Agent will follow up with you._"
             )
             blocks = format_response_blocks(denial_text, settings.sn_instance_url)
             await client.chat_update(
@@ -970,9 +988,9 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     channel=approval["channel_id"],
                     thread_ts=thread,
                     text=(
-                        ":no_entry: Some troubleshooting steps were reviewed by IT "
-                        "and not approved for this issue. "
-                        "Please reach out to the help desk for further assistance."
+                        ":rotating_light: The troubleshooting steps for this issue have been "
+                        "reviewed by IT and escalated for further assistance. "
+                        "A Support Agent will follow up with you."
                     ),
                 )
         except Exception:
@@ -3827,12 +3845,28 @@ async def _process_expired_rec_approvals(settings: Settings) -> None:
         for rec_id in rec_ids:
             await db.increment_recommendation_denial(rec_id)
 
-        # Update the user's message with timeout notice
+        # Escalate the ticket to high priority
+        interaction_id = approval.get("interaction_id")
+        if interaction_id:
+            try:
+                interaction = await db.get_interaction(interaction_id)
+                if interaction and interaction.get("ticket_id"):
+                    await update_ticket(
+                        interaction["ticket_id"],
+                        priority="high",
+                        comment=f"Recommendation approval timed out after {_APPROVAL_TIMEOUT_MINUTES}min — escalating for agent follow-up.",
+                        _settings=settings,
+                    )
+                    logger.info("Escalated ticket %s after recommendation timeout", interaction["ticket_id"])
+            except Exception:
+                logger.debug("Failed to escalate ticket on recommendation timeout", exc_info=True)
+
+        # Update the user's message with escalation notice
         try:
             timeout_text = (
                 f"{approval['redacted_text'].rsplit(':hourglass_flowing_sand:', 1)[0].rstrip()}"
-                "\n\n:hourglass: _The specific troubleshooting steps were not reviewed in time "
-                "and have been removed. Please contact the help desk for further assistance._"
+                "\n\n:rotating_light: _The troubleshooting steps require further review. "
+                "This issue has been escalated and a Support Agent will follow up with you._"
             )
             blocks = format_response_blocks(timeout_text, settings.sn_instance_url)
             await client.chat_update(
