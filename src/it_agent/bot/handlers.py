@@ -911,31 +911,45 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     rec_id, updated_rec["approval_count"],
                 )
 
-        # Update the user's message with the full original response
+        # Check if conversation moved to an incident channel
+        orig_channel = approval["channel_id"]
+        orig_thread = approval.get("thread_ts", "")
+        incident_ch = _find_incident_channel_for_thread(orig_channel, orig_thread)
+
+        # Deliver the approved response
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             sn_url = settings.sn_instance_url
             original = approval["original_text"]
             linked = linkify_servicenow_refs(original, sn_url)
             blocks = format_response_blocks(original, sn_url)
-            await client.chat_update(
-                channel=approval["channel_id"],
-                ts=approval["message_ts"],
-                text=linked,
-                blocks=blocks,
-            )
-            # Post a thread reply so the user gets a Slack notification
-            thread = approval.get("thread_ts", "")
-            if thread:
+
+            if incident_ch:
+                # Post as a new message in the incident channel
                 await client.chat_postMessage(
-                    channel=approval["channel_id"],
-                    thread_ts=thread,
-                    text=(
-                        ":white_check_mark: The troubleshooting steps for this issue "
-                        "have been reviewed and approved by IT. "
-                        "Please see the updated message above."
-                    ),
+                    channel=incident_ch,
+                    text=linked,
+                    blocks=blocks,
                 )
+            else:
+                # Update the redacted message in the original thread
+                await client.chat_update(
+                    channel=orig_channel,
+                    ts=approval["message_ts"],
+                    text=linked,
+                    blocks=blocks,
+                )
+                # Post a thread reply so the user gets a Slack notification
+                if orig_thread:
+                    await client.chat_postMessage(
+                        channel=orig_channel,
+                        thread_ts=orig_thread,
+                        text=(
+                            ":white_check_mark: The troubleshooting steps for this issue "
+                            "have been reviewed and approved by IT. "
+                            "Please see the updated message above."
+                        ),
+                    )
         except Exception:
             logger.debug("Failed to update user message on recommendation approval", exc_info=True)
 
@@ -1232,30 +1246,44 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             ):
                 await db.update_recommendation(rec_id, status="trusted")
 
-        # Replace the user's redacted message with the refined response
+        # Check if conversation moved to an incident channel
+        orig_channel = approval["channel_id"]
+        orig_thread = approval.get("thread_ts", "")
+        incident_ch = _find_incident_channel_for_thread(orig_channel, orig_thread)
+
+        # Deliver the refined response
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
             sn_url = settings.sn_instance_url
             linked = linkify_servicenow_refs(refined_text, sn_url)
             blocks = format_response_blocks(refined_text, sn_url)
-            await client.chat_update(
-                channel=approval["channel_id"],
-                ts=approval["message_ts"],
-                text=linked,
-                blocks=blocks,
-            )
-            # Post thread notification to the user
-            thread = approval.get("thread_ts", "")
-            if thread:
+
+            if incident_ch:
+                # Post as a new message in the incident channel
                 await client.chat_postMessage(
-                    channel=approval["channel_id"],
-                    thread_ts=thread,
-                    text=(
-                        ":pencil2: The troubleshooting steps for this issue "
-                        "have been reviewed, refined, and approved by IT. "
-                        "Please see the updated message above."
-                    ),
+                    channel=incident_ch,
+                    text=linked,
+                    blocks=blocks,
                 )
+            else:
+                # Update the redacted message in the original thread
+                await client.chat_update(
+                    channel=orig_channel,
+                    ts=approval["message_ts"],
+                    text=linked,
+                    blocks=blocks,
+                )
+                # Post thread notification to the user
+                if orig_thread:
+                    await client.chat_postMessage(
+                        channel=orig_channel,
+                        thread_ts=orig_thread,
+                        text=(
+                            ":pencil2: The troubleshooting steps for this issue "
+                            "have been reviewed, refined, and approved by IT. "
+                            "Please see the updated message above."
+                        ),
+                    )
         except Exception:
             logger.debug("Failed to update user message with refined recommendation", exc_info=True)
 
