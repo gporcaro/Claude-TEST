@@ -145,6 +145,40 @@ async def resolve_debug_channel(settings: Settings) -> None:
         logger.warning("Failed to resolve debug channel", exc_info=True)
 
 
+async def recover_active_refinements(settings: Settings) -> None:
+    """Re-populate _active_refinements from DB for approvals in 'refining' status.
+
+    This ensures refinement threads survive bot restarts.
+    """
+    try:
+        refining = await db.get_refining_rec_approvals()
+        for approval in refining:
+            ch = approval.get("approval_channel")
+            ts = approval.get("approval_message_ts")
+            if not ch or not ts:
+                continue
+            approval_id = approval["id"]
+            _active_refinements[(ch, ts)] = approval_id
+            # Seed conversation context so the agent can continue refining
+            _conversations[(ch, ts)] = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Here is the original response that needs refinement:\n\n"
+                        f"{approval['original_text']}\n\n"
+                        f"I'm ready to help you refine this response. "
+                        f"What changes would you like to make?"
+                    ),
+                },
+            ]
+        if refining:
+            logger.info(
+                "Recovered %d active refinement(s) from database", len(refining),
+            )
+    except Exception:
+        logger.warning("Failed to recover active refinements", exc_info=True)
+
+
 def _summarize_args(name: str, args: dict | None) -> str:
     """One-liner summary of tool arguments (truncated)."""
     if not args:

@@ -582,6 +582,17 @@ async def update_pending_rec_approval(approval_id: int, **fields: Any) -> None:
     await _db.commit()
 
 
+async def get_refining_rec_approvals() -> list[dict]:
+    """Return recommendation approvals currently in 'refining' status."""
+    if _db is None:
+        return []
+    cursor = await _db.execute(
+        "SELECT * FROM pending_recommendation_approvals WHERE status = 'refining'",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def get_expired_rec_approvals(older_than_minutes: int = 30) -> list[dict]:
     """Return pending recommendation approvals older than the given threshold."""
     if _db is None:
