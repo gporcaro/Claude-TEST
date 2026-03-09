@@ -1253,6 +1253,42 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 _conversations.pop(key, None)
                 break
 
+        # Dismiss Send/Continue buttons and show confirmation with nav link
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
+            # Build navigation link to the user's conversation
+            conv_channel = approval.get("channel_id", "")
+            conv_thread = approval.get("thread_ts", "")
+            link_text = ""
+            if conv_thread and conv_channel:
+                link_resp = await client.chat_getPermalink(
+                    channel=conv_channel, message_ts=conv_thread,
+                )
+                permalink = link_resp.get("permalink", "")
+                if permalink:
+                    link_text = f" <{permalink}|View conversation>"
+            elif conv_channel:
+                link_text = f" <#{conv_channel}>"
+
+            msg = body.get("message", {})
+            original_blocks = msg.get("blocks", [])
+            text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            text_blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":white_check_mark: Refined response sent to the user.{link_text}",
+                },
+            })
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=msg["ts"],
+                text=msg.get("text", ""),
+                blocks=text_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to dismiss send refined buttons", exc_info=True)
+
         await emit("recommendation_refined", {
             "approval_id": approval_id, "sender": sender_name,
         })
