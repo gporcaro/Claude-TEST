@@ -3360,13 +3360,13 @@ async def _handle_help_channel_message(
             await _record_agent_result(iid, text, result)
 
         # Recommendation approval gate
+        sn_url = settings.sn_instance_url
         user_display = await _resolve_user_name(user_id, settings)
         final_text, gated_msg_ts = await _gate_recommendations(
             result.text, channel, thread_ts, say, settings,
             interaction_id=iid, user_name=user_display,
         )
         if gated_msg_ts is None:
-            sn_url = settings.sn_instance_url
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
             await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
