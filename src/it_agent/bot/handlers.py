@@ -1254,12 +1254,11 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 break
 
         # Dismiss Send/Continue buttons and show confirmation with nav link
+        link_text = ""
         try:
             client = AsyncWebClient(token=settings.slack_bot_token)
-            # Build navigation link to the user's conversation
             conv_channel = approval.get("channel_id", "")
             conv_thread = approval.get("thread_ts", "")
-            link_text = ""
             if conv_thread and conv_channel:
                 link_resp = await client.chat_getPermalink(
                     channel=conv_channel, message_ts=conv_thread,
@@ -1269,7 +1268,11 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     link_text = f" <{permalink}|View conversation>"
             elif conv_channel:
                 link_text = f" <#{conv_channel}>"
+        except Exception:
+            logger.debug("Failed to build nav link for refined recommendation", exc_info=True)
 
+        try:
+            client = AsyncWebClient(token=settings.slack_bot_token)
             msg = body.get("message", {})
             original_blocks = msg.get("blocks", [])
             text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
