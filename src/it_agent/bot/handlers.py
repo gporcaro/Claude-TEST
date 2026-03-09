@@ -2047,18 +2047,26 @@ async def _extract_user_profile_updates(
         response = await client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=(
-                "Analyze this IT support conversation and extract any factual details "
-                "about the user that were explicitly stated or clearly demonstrated. "
-                "Only include information the user directly revealed — do not guess or infer.\n\n"
+                "Analyze this IT support conversation and extract STABLE factual details "
+                "about the user that the USER explicitly stated. Only include information "
+                "the user directly revealed — do not guess, infer, or extract details from "
+                "the assistant's responses or assumptions.\n\n"
+                "IMPORTANT: Only extract PERMANENT user attributes — things that stay true "
+                "across multiple support tickets. Do NOT extract:\n"
+                "- The specific issue or symptoms being discussed (those are ticket-specific)\n"
+                "- Software or applications mentioned in passing or as part of troubleshooting\n"
+                "- Applications the assistant assumed or suggested\n"
+                "- Temporary states (e.g., 'laptop is slow today')\n\n"
                 "Return a JSON object with only the fields you found (omit fields with no information):\n"
-                '- "device_type": specific device (e.g., "MacBook Pro", "Dell Latitude 5540")\n'
-                '- "os": operating system (e.g., "macOS Sonoma", "Windows 11")\n'
+                '- "device_type": specific device model the user said they use (e.g., "MacBook Pro", "Dell Latitude 5540")\n'
+                '- "os": operating system the user said they run (e.g., "macOS Sonoma", "Windows 11")\n'
                 '- "technical_level": "beginner", "intermediate", or "advanced" based on how they '
                 "describe their issue and interact\n"
-                '- "role": job title or role if mentioned\n'
-                '- "department": department if mentioned\n'
-                '- "notes": any other relevant details (peripherals, recurring issues, software they use)\n\n'
-                "Return {} if no new user information was revealed.\n\n"
+                '- "role": job title or role if the user mentioned it\n'
+                '- "department": department if the user mentioned it\n'
+                '- "notes": ONLY permanent details like hardware setup (e.g., "uses dual monitors", '
+                '"has docking station") — NOT applications, symptoms, or issue-specific details\n\n'
+                "Return {} if no new STABLE user information was revealed.\n\n"
                 "IMPORTANT: Return ONLY the JSON object, no other text.\n\n"
                 f"Conversation:\n{formatted}"
             ),
@@ -2111,6 +2119,10 @@ async def _extract_recommendations(
                 "(e.g., 'disable your Chrome extensions', 'try disabling extensions one by one'). "
                 "These are NOT basic advice — they affect the user's browser configuration and must "
                 "be extracted.\n\n"
+                "Also include application-specific feature changes or built-in tool usage "
+                "(e.g., 'enable Memory Saver in Chrome', 'use Chrome Task Manager to kill tabs', "
+                "'enable efficiency mode in Edge', 'turn on hardware acceleration'). "
+                "These are settings or feature toggles within specific applications.\n\n"
                 "Do NOT include basic/generic advice like: restart, reboot, check cables, "
                 "clear cache, try again, log out/in, check internet, update browser, "
                 "close and reopen, power cycle.\n\n"

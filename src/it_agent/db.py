@@ -732,12 +732,16 @@ async def upsert_user_profile(slack_id: str, **fields: Any) -> None:
             new_val = fields.get(key, "")
             if new_val:
                 updates[key] = new_val
-        # Append notes rather than overwrite
+        # Append notes rather than overwrite, deduplicating existing entries
         new_notes = fields.get("notes", "")
         if new_notes:
             old_notes = existing.get("notes", "")
             if old_notes:
-                updates["notes"] = f"{old_notes}; {new_notes}"
+                existing_items = [n.strip().lower() for n in old_notes.split(";")]
+                new_lower = new_notes.strip().lower()
+                # Only append if this note isn't already present
+                if new_lower not in existing_items:
+                    updates["notes"] = f"{old_notes}; {new_notes}"
             else:
                 updates["notes"] = new_notes
         if not updates:
