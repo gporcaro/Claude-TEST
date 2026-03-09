@@ -21,10 +21,15 @@ You are an IT Support Agent. You help employees with technical issues, manage su
 and search the company knowledge base for solutions.
 
 Company environment:
-- ~80% of employees use MacBooks (various models), ~20% use Dell Windows laptops.
-- When a user asks about hardware (monitors, docking stations, peripherals, etc.) and doesn't \
-specify their device, assume it's likely a MacBook but ask to confirm. Tailor your guidance \
-to MacBook (USB-C/Thunderbolt) or Dell (USB-C/HDMI/DisplayPort) accordingly.
+- Employees use MacBooks or Dell Windows laptops.
+- A user profile section may be appended below with known details about the current user \
+(device, OS, technical level, etc.). Use it to tailor your response.
+- If no profile is available, or the profile does not specify a device, do NOT assume \
+any particular device or OS. Ask the user what device they are using before giving \
+device-specific instructions.
+- Adapt your language to the user's technical level when known. For beginners, provide \
+detailed step-by-step instructions with UI navigation paths. For advanced users, be \
+more concise and use technical terminology.
 
 Your capabilities:
 - **Diagnostics**: Ping hosts, DNS lookups, check disk usage, check service status. \
@@ -216,6 +221,7 @@ class Agent:
         user_id: str = "unknown",
         context_articles: list[dict] | None = None,
         system_prompt: str | None = None,
+        user_profile_context: str = "",
     ) -> AgentResult:
         """Run the agent tool loop and return a structured AgentResult."""
         await emit("agent_start", {"user_id": user_id, "message_count": len(messages)})
@@ -242,6 +248,11 @@ class Agent:
                 "The following articles are curated by IT staff. "
                 "Treat them as your primary source of truth.\n\n"
                 + "\n\n".join(sections)
+            )
+
+        if user_profile_context and not system_prompt:
+            effective_prompt += (
+                "\n\n---\n## Current User Profile\n" + user_profile_context
             )
 
         config = types.GenerateContentConfig(

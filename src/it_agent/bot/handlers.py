@@ -1951,6 +1951,83 @@ def _classify_risk_level(recommendations: list[dict]) -> str:
     return "low"  # medium/low both use standard gating
 
 
+# ---------------------------------------------------------------------------
+# User profile helpers
+# ---------------------------------------------------------------------------
+
+def _build_profile_context(profile: dict) -> str:
+    """Format a user profile dict into a readable string for the system prompt."""
+    labels = {
+        "device_type": "Device",
+        "os": "OS",
+        "technical_level": "Technical level",
+        "role": "Role",
+        "department": "Department",
+        "notes": "Notes",
+    }
+    lines = []
+    for key, label in labels.items():
+        value = profile.get(key, "")
+        if value:
+            lines.append(f"- {label}: {value}")
+    return "\n".join(lines)
+
+
+async def _extract_user_profile_updates(
+    conversation_history: list[dict], user_id: str, settings: Settings,
+) -> dict:
+    """Use Gemini to extract user details revealed during the conversation."""
+    try:
+        formatted = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in conversation_history[-10:]
+        )
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=(
+                "Analyze this IT support conversation and extract any factual details "
+                "about the user that were explicitly stated or clearly demonstrated. "
+                "Only include information the user directly revealed — do not guess or infer.\n\n"
+                "Return a JSON object with only the fields you found (omit fields with no information):\n"
+                '- "device_type": specific device (e.g., "MacBook Pro", "Dell Latitude 5540")\n'
+                '- "os": operating system (e.g., "macOS Sonoma", "Windows 11")\n'
+                '- "technical_level": "beginner", "intermediate", or "advanced" based on how they '
+                "describe their issue and interact\n"
+                '- "role": job title or role if mentioned\n'
+                '- "department": department if mentioned\n'
+                '- "notes": any other relevant details (peripherals, recurring issues, software they use)\n\n'
+                "Return {} if no new user information was revealed.\n\n"
+                "IMPORTANT: Return ONLY the JSON object, no other text.\n\n"
+                f"Conversation:\n{formatted}"
+            ),
+        )
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            return {}
+        # Only keep valid fields
+        valid_keys = {"device_type", "os", "technical_level", "role", "department", "notes"}
+        return {k: v for k, v in result.items() if k in valid_keys and v}
+    except Exception:
+        logger.debug("Failed to extract user profile updates", exc_info=True)
+        return {}
+
+
+async def _update_user_profile_from_conversation(
+    history: list[dict], user_id: str, settings: Settings,
+) -> None:
+    """Extract profile updates from conversation and persist them (fire-and-forget)."""
+    try:
+        updates = await _extract_user_profile_updates(history, user_id, settings)
+        if updates:
+            await db.upsert_user_profile(user_id, **updates)
+            logger.info("Updated user profile for %s: %s", user_id, list(updates.keys()))
+    except Exception:
+        logger.debug("Failed to update user profile from conversation", exc_info=True)
+
+
 async def _extract_recommendations(
     response_text: str, settings: Settings,
 ) -> list[dict]:
@@ -1968,6 +2045,10 @@ async def _extract_recommendations(
                 "Analyze the following IT support response and extract ONLY specific, "
                 "actionable recommendations that involve changing settings, installing "
                 "software, running commands, modifying configuration, or disabling features. "
+                "Include recommendations to disable, enable, or remove browser extensions "
+                "(e.g., 'disable your Chrome extensions', 'try disabling extensions one by one'). "
+                "These are NOT basic advice — they affect the user's browser configuration and must "
+                "be extracted.\n\n"
                 "Do NOT include basic/generic advice like: restart, reboot, check cables, "
                 "clear cache, try again, log out/in, check internet, update browser, "
                 "close and reopen, power cycle.\n\n"
@@ -2386,10 +2467,16 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
     try:
         agent = _get_agent(settings)
+
+        # Fetch user profile for context
+        profile = await db.get_user_profile(user_id)
+        profile_context = _build_profile_context(profile) if profile else ""
+
         result: AgentResult = await agent.run(
             history,
             user_id=user_id,
             context_articles=list(_ai_context_articles.values()),
+            user_profile_context=profile_context,
         )
 
         # Append assistant response to history
@@ -2423,6 +2510,11 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
+
+        # Update user profile from conversation (fire-and-forget)
+        asyncio.create_task(
+            _update_user_profile_from_conversation(history, user_id, settings)
+        )
 
     except Exception as exc:
         logger.exception("Error processing message")
@@ -2656,10 +2748,16 @@ async def _handle_incident_message(
 
     try:
         agent = _get_agent(settings)
+
+        # Fetch user profile for context
+        profile = await db.get_user_profile(user_id)
+        profile_context = _build_profile_context(profile) if profile else ""
+
         result: AgentResult = await agent.run(
             history,
             user_id=user_id,
             context_articles=list(_ai_context_articles.values()),
+            user_profile_context=profile_context,
         )
 
         history.append({"role": "assistant", "content": result.text})
@@ -2705,6 +2803,11 @@ async def _handle_incident_message(
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, None, settings)
+
+        # Update user profile from conversation (fire-and-forget)
+        asyncio.create_task(
+            _update_user_profile_from_conversation(history, user_id, settings)
+        )
 
         # Notify #it-helpdesk when escalation happens in an incident channel
         if settings.it_helpdesk_channel_id:
@@ -3148,10 +3251,16 @@ async def _handle_help_channel_message(
 
     try:
         agent = _get_agent(settings)
+
+        # Fetch user profile for context
+        profile = await db.get_user_profile(user_id)
+        profile_context = _build_profile_context(profile) if profile else ""
+
         result: AgentResult = await agent.run(
             history,
             user_id=user_id,
             context_articles=list(_ai_context_articles.values()),
+            user_profile_context=profile_context,
         )
 
         history.append({"role": "assistant", "content": result.text})
@@ -3194,6 +3303,11 @@ async def _handle_help_channel_message(
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
             await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+
+        # Update user profile from conversation (fire-and-forget)
+        asyncio.create_task(
+            _update_user_profile_from_conversation(history, user_id, settings)
+        )
 
         # ── Post ticket follow-up with "Move to private channel" button ──
         if auto_ticket_info and auto_ticket_info.get("success"):

@@ -154,6 +154,18 @@ CREATE TABLE IF NOT EXISTS collaborative_reviews (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    slack_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    os TEXT NOT NULL DEFAULT '',
+    technical_level TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -673,3 +685,76 @@ async def get_expired_collaborative_reviews(older_than_minutes: int = 30) -> lis
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# User profiles
+# ---------------------------------------------------------------------------
+
+async def get_user_profile(slack_id: str) -> Optional[dict]:
+    """Fetch a user profile by Slack ID."""
+    if _db is None:
+        return None
+    cursor = await _db.execute(
+        "SELECT * FROM user_profiles WHERE slack_id = ?", (slack_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_user_profile(slack_id: str, **fields: Any) -> None:
+    """Create or update a user profile, merging non-empty fields.
+
+    For the ``notes`` field, new text is appended rather than overwriting.
+    Empty-string values are ignored so they don't clobber existing data.
+    """
+    if _db is None:
+        return
+
+    existing = await get_user_profile(slack_id)
+    now = _now_iso()
+
+    if existing:
+        updates: dict[str, Any] = {}
+        for key in ("display_name", "device_type", "os", "technical_level",
+                     "role", "department"):
+            new_val = fields.get(key, "")
+            if new_val:
+                updates[key] = new_val
+        # Append notes rather than overwrite
+        new_notes = fields.get("notes", "")
+        if new_notes:
+            old_notes = existing.get("notes", "")
+            if old_notes:
+                updates["notes"] = f"{old_notes}; {new_notes}"
+            else:
+                updates["notes"] = new_notes
+        if not updates:
+            return
+        updates["updated_at"] = now
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [slack_id]
+        await _db.execute(
+            f"UPDATE user_profiles SET {set_clause} WHERE slack_id = ?",  # noqa: S608
+            values,
+        )
+    else:
+        profile = {
+            "slack_id": slack_id,
+            "display_name": fields.get("display_name", ""),
+            "device_type": fields.get("device_type", ""),
+            "os": fields.get("os", ""),
+            "technical_level": fields.get("technical_level", ""),
+            "role": fields.get("role", ""),
+            "department": fields.get("department", ""),
+            "notes": fields.get("notes", ""),
+            "updated_at": now,
+        }
+        cols = ", ".join(profile.keys())
+        placeholders = ", ".join("?" for _ in profile)
+        await _db.execute(
+            f"INSERT INTO user_profiles ({cols}) VALUES ({placeholders})",  # noqa: S608
+            list(profile.values()),
+        )
+
+    await _db.commit()
