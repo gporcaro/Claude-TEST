@@ -931,6 +931,12 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     text=linked,
                     blocks=blocks,
                 )
+                # Update live summary with the approved recommendation
+                await _update_incident_summary(incident_ch, original, settings)
+                inc_ctx = _incident_context.get(incident_ch, {})
+                inc_tid = inc_ctx.get("ticket_id")
+                if inc_tid:
+                    _push_live_summary_now(inc_tid, settings)
             else:
                 # Update the redacted message in the original thread
                 await client.chat_update(
@@ -1265,6 +1271,12 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     text=linked,
                     blocks=blocks,
                 )
+                # Update live summary with the refined recommendation
+                await _update_incident_summary(incident_ch, refined_text, settings)
+                inc_ctx = _incident_context.get(incident_ch, {})
+                inc_tid = inc_ctx.get("ticket_id")
+                if inc_tid:
+                    _push_live_summary_now(inc_tid, settings)
             else:
                 # Update the redacted message in the original thread
                 await client.chat_update(
@@ -1360,22 +1372,8 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
     @app.action("continue_refining")
     async def handle_continue_refining(ack, body) -> None:
+        """Legacy handler — button removed, but ack any stale clicks."""
         await ack()
-        # Dismiss the Send/Continue buttons by updating the message to remove them
-        try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
-            msg = body.get("message", {})
-            # Keep only the text blocks, remove the actions block
-            original_blocks = msg.get("blocks", [])
-            text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
-            await client.chat_update(
-                channel=body["channel"]["id"],
-                ts=msg["ts"],
-                text=msg.get("text", ""),
-                blocks=text_blocks,
-            )
-        except Exception:
-            logger.debug("Failed to dismiss continue refining buttons", exc_info=True)
 
     # --- Collaborative review actions ---
 

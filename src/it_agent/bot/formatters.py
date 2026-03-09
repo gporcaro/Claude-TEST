@@ -293,7 +293,7 @@ def format_refinement_context_blocks(
 
 
 def format_refinement_send_button(approval_id: int) -> list[dict]:
-    """Build Slack blocks with Send to User / Continue Refining buttons."""
+    """Build Slack blocks with a Send to User button."""
     return [
         {
             "type": "actions",
@@ -304,12 +304,6 @@ def format_refinement_send_button(approval_id: int) -> list[dict]:
                     "action_id": "send_refined_recommendation",
                     "value": str(approval_id),
                     "style": "primary",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Continue Refining"},
-                    "action_id": "continue_refining",
-                    "value": str(approval_id),
                 },
             ],
         },
