@@ -582,6 +582,7 @@ async def discover_incident_channels(settings: Settings) -> None:
         # Also track channels whose name ends with "-resolved" so we can
         # recover auto-close tracking after a restart.
         resolved_ticket_ids: list[str] = []
+        on_hold_ticket_ids: list[str] = []
 
         for ch_id in channel_ids:
             try:
@@ -634,6 +635,12 @@ async def discover_incident_channels(settings: Settings) -> None:
                     if tid:
                         resolved_ticket_ids.append(tid)
 
+                # Track on-hold channels for stale-suffix cleanup
+                if ch_name.endswith("-onhold"):
+                    tid = _incident_context.get(ch_id, {}).get("ticket_id")
+                    if tid:
+                        on_hold_ticket_ids.append(tid)
+
             except Exception:
                 logger.debug("Could not fetch history for channel %s", ch_id)
 
@@ -663,6 +670,35 @@ async def discover_incident_channels(settings: Settings) -> None:
                             )
                     except Exception:
                         logger.debug("Could not check SN status for %s", tid)
+            finally:
+                await sn_client.close()
+
+        # Clean up stale -onhold suffixes: if the ticket has been resumed
+        # (in_progress) while the bot was down, strip the suffix now.
+        if on_hold_ticket_ids:
+            sn_client = ServiceNowClient(
+                settings.sn_instance_url, settings.sn_username, settings.sn_password,
+            )
+            try:
+                for tid in on_hold_ticket_ids:
+                    try:
+                        incident = await sn_client.get_incident(tid)
+                        if incident is None:
+                            continue
+                        status = incident.get("status")
+                        if status == "on_hold":
+                            continue  # still on hold, leave suffix
+                        # Ticket is no longer on_hold — strip the suffix
+                        _safe_create_task(
+                            _rename_incident_channel_active(tid, _slack_client),
+                            name=f"startup_rename_active_{tid}",
+                        )
+                        logger.info(
+                            "Cleaning stale -onhold suffix for %s (status=%s)",
+                            tid, status,
+                        )
+                    except Exception:
+                        logger.debug("Could not check SN status for on-hold %s", tid)
             finally:
                 await sn_client.close()
 
@@ -3106,6 +3142,19 @@ async def _handle_incident_message(
                 except Exception:
                     logger.debug("Failed to post escalation notice to #it-helpdesk", exc_info=True)
 
+        # Rename incident channel when agent sets on_hold (e.g. vendor outage)
+        for tc in result.tool_calls:
+            if tc["name"] != "update_ticket":
+                continue
+            args = tc.get("args", {})
+            if args.get("status") == "on_hold":
+                tc_ticket_id = args.get("ticket_id", "")
+                if tc_ticket_id:
+                    _safe_create_task(
+                        _rename_incident_channel_on_hold(tc_ticket_id, _slack_client),
+                        name=f"rename_onhold_{tc_ticket_id}",
+                    )
+
     except Exception as exc:
         logger.exception("Error processing incident channel message")
         await emit("error", {"source": "incident", "message": str(exc)[:300]})
@@ -4129,6 +4178,51 @@ async def _rename_incident_channel_resolved(
         logger.warning("Failed to rename incident channel %s", channel_id, exc_info=True)
 
 
+async def _rename_incident_channel_on_hold(
+    ticket_id: str, client: AsyncWebClient
+) -> None:
+    """Find the incident channel for *ticket_id* and append '-onhold' to its name."""
+    channel_id = _ticket_to_channel.get(ticket_id)
+
+    if channel_id is None:
+        return
+
+    try:
+        info = await client.conversations_info(channel=channel_id)
+        current_name = info["channel"]["name"]
+        if current_name.endswith("-onhold"):
+            return  # already renamed
+        # Strip -resolved if present before adding -onhold
+        if current_name.endswith("-resolved"):
+            current_name = current_name[: -len("-resolved")]
+        new_name = f"{current_name}-onhold"[:80]
+        await client.conversations_rename(channel=channel_id, name=new_name)
+        logger.info("Renamed incident channel %s → %s", info["channel"]["name"], new_name)
+    except Exception:
+        logger.warning("Failed to rename incident channel %s to on-hold", channel_id, exc_info=True)
+
+
+async def _rename_incident_channel_active(
+    ticket_id: str, client: AsyncWebClient
+) -> None:
+    """Strip the '-onhold' suffix from the incident channel for *ticket_id*."""
+    channel_id = _ticket_to_channel.get(ticket_id)
+
+    if channel_id is None:
+        return
+
+    try:
+        info = await client.conversations_info(channel=channel_id)
+        current_name = info["channel"]["name"]
+        if not current_name.endswith("-onhold"):
+            return  # nothing to strip
+        new_name = current_name[: -len("-onhold")]
+        await client.conversations_rename(channel=channel_id, name=new_name)
+        logger.info("Renamed incident channel %s → %s", current_name, new_name)
+    except Exception:
+        logger.warning("Failed to strip on-hold suffix from channel %s", channel_id, exc_info=True)
+
+
 def _prune_stale_conversations() -> None:
     """Remove conversation histories older than 24 hours."""
     cutoff = time.time() - 86400
@@ -4295,6 +4389,10 @@ async def _process_pending_on_holds(settings: Settings) -> None:
                     current_state=incident.get("_raw_state", "2"),
                 )
                 logger.info("Set ticket %s to on_hold (awaiting user response)", ticket_id)
+                _safe_create_task(
+                    _rename_incident_channel_on_hold(ticket_id, _slack_client),
+                    name=f"rename_onhold_{ticket_id}",
+                )
             except Exception:
                 logger.warning("Failed to set %s to on_hold", ticket_id, exc_info=True)
             _awaiting_user_response.pop(ticket_id, None)
@@ -4316,6 +4414,10 @@ async def _resume_from_on_hold(ticket_id: str, settings: Settings) -> None:
                 current_state=incident.get("_raw_state", "3"),
             )
             logger.info("Resumed ticket %s from on_hold to in_progress", ticket_id)
+            _safe_create_task(
+                _rename_incident_channel_active(ticket_id, _slack_client),
+                name=f"rename_active_{ticket_id}",
+            )
     except Exception:
         logger.warning("Failed to resume %s from on_hold", ticket_id, exc_info=True)
     finally:
