@@ -2990,7 +2990,7 @@ async def _handle_incident_message(
                 try:
                     escalation_client = AsyncWebClient(token=settings.slack_bot_token)
                     user_display = await _resolve_user_name(user_id, settings)
-                    await escalation_client.chat_postMessage(
+                    esc_resp = await escalation_client.chat_postMessage(
                         channel=settings.it_helpdesk_channel_id,
                         text=(
                             f":rotating_light: *Escalation: {tc_ticket_id}*\n"
@@ -3000,6 +3000,10 @@ async def _handle_incident_message(
                             f"Please join the channel to assist."
                         ),
                     )
+                    # Store the escalation message ts for later resolution update
+                    ctx = _incident_context.get(channel)
+                    if ctx:
+                        ctx["escalation_msg_ts"] = esc_resp["ts"]
                     logger.info("Posted escalation notice to #it-helpdesk for %s", tc_ticket_id)
                 except Exception:
                     logger.debug("Failed to post escalation notice to #it-helpdesk", exc_info=True)
@@ -3838,6 +3842,24 @@ async def post_resolution_update(
             break
 
     if channel_id is not None:
+        # Update the escalation message in #it-helpdesk to show resolved status
+        ctx = _incident_context.get(channel_id, {})
+        escalation_ts = ctx.get("escalation_msg_ts")
+        if escalation_ts and settings.it_helpdesk_channel_id:
+            close_notes = ticket_data.get("close_notes", "")
+            updated_text = f":white_check_mark: ~*Escalation: {ticket_id}*~ — *Resolved*"
+            if close_notes:
+                updated_text += f"\n>_{close_notes}_"
+            updated_text = linkify_servicenow_refs(updated_text, settings.sn_instance_url)
+            try:
+                await client.chat_update(
+                    channel=settings.it_helpdesk_channel_id,
+                    ts=escalation_ts,
+                    text=updated_text,
+                )
+            except Exception:
+                logger.debug("Failed to update escalation message for %s", ticket_id, exc_info=True)
+
         notice = (
             f":white_check_mark: *Ticket {ticket_id} has been resolved.*\n\n"
             f"This channel will be automatically archived in 48 hours. "
