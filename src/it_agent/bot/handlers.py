@@ -87,6 +87,11 @@ _debug_channel_id: str | None = None
 # Active refinement threads: (helpdesk_channel, approval_message_ts) → approval_id
 _active_refinements: dict[tuple[str, str], int] = {}
 
+# Deduplication: track message timestamps currently being processed to prevent
+# the same Slack event from being handled concurrently (e.g. Socket Mode retries
+# that arrive while an earlier delivery is still awaiting an API call).
+_processing_messages: set[str] = set()
+
 
 async def load_ai_context_articles(settings: Settings) -> None:
     """Fetch KB articles prefixed with [AI Context] and cache them for agent use."""
@@ -648,12 +653,21 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         if channel in _incident_channels:
             return
 
-        # Strip the bot mention from the text
-        text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
-        if not text:
-            await say("Hi! I'm the IT Support Agent. How can I help you?")
+        # Deduplicate (same guard as handle_message)
+        msg_ts = event.get("ts", "")
+        if msg_ts in _processing_messages:
             return
-        await _handle_message(event, text, say, settings)
+        _processing_messages.add(msg_ts)
+
+        try:
+            # Strip the bot mention from the text
+            text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
+            if not text:
+                await say("Hi! I'm the IT Support Agent. How can I help you?")
+                return
+            await _handle_message(event, text, say, settings)
+        finally:
+            _processing_messages.discard(msg_ts)
 
     @app.event("message")
     async def handle_message(event: dict, say) -> None:
@@ -662,44 +676,55 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         if event.get("subtype") or event.get("bot_id"):
             return
 
+        # Deduplicate: prevent the same event from being handled concurrently
+        # (Socket Mode can re-deliver while we're awaiting an API call)
+        msg_ts = event.get("ts", "")
+        if msg_ts in _processing_messages:
+            return
+        _processing_messages.add(msg_ts)
+
         text = event.get("text", "").strip()
         if not text:
+            _processing_messages.discard(msg_ts)
             return
 
         channel_type = event.get("channel_type", "")
         channel = event.get("channel", "")
 
-        # DM → process as before
-        if channel_type == "im":
-            await _handle_message(event, text, say, settings)
-            return
-
-        # #help-it channel → proactive handler
-        if settings.help_channel_id and channel == settings.help_channel_id:
-            # Strip any @bot mention so we don't echo it back
-            text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
-            if not text:
+        try:
+            # DM → process as before
+            if channel_type == "im":
+                await _handle_message(event, text, say, settings)
                 return
-            await _handle_help_channel_message(event, text, say, settings)
-            return
 
-        # Incident channels → continue conversation (no threading)
-        if channel in _incident_channels:
-            await _handle_incident_message(event, text, say, settings)
-            return
+            # #help-it channel → proactive handler
+            if settings.help_channel_id and channel == settings.help_channel_id:
+                # Strip any @bot mention so we don't echo it back
+                text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+                if not text:
+                    return
+                await _handle_help_channel_message(event, text, say, settings)
+                return
 
-        # Refinement threads in #it-helpdesk
-        thread_ts = event.get("thread_ts", "")
-        if (
-            settings.it_helpdesk_channel_id
-            and channel == settings.it_helpdesk_channel_id
-            and thread_ts
-            and (channel, thread_ts) in _active_refinements
-        ):
-            await _handle_refinement_message(event, text, settings)
-            return
+            # Incident channels → continue conversation (no threading)
+            if channel in _incident_channels:
+                await _handle_incident_message(event, text, say, settings)
+                return
 
-        # Other channels → ignore (handled by app_mention only)
+            # Refinement threads in #it-helpdesk
+            thread_ts = event.get("thread_ts", "")
+            if (
+                settings.it_helpdesk_channel_id
+                and channel == settings.it_helpdesk_channel_id
+                and thread_ts
+                and (channel, thread_ts) in _active_refinements
+            ):
+                await _handle_refinement_message(event, text, settings)
+                return
+
+            # Other channels → ignore (handled by app_mention only)
+        finally:
+            _processing_messages.discard(msg_ts)
 
     # Wire the resolution callback
     async def _resolution_callback(
@@ -2012,6 +2037,28 @@ def _classify_risk_level(recommendations: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Processing indicator helper
+# ---------------------------------------------------------------------------
+
+async def _post_processing_indicator(say, **kwargs) -> str:
+    """Post a processing indicator and return its message ts."""
+    try:
+        msg = await say(
+            text=":hourglass_flowing_sand: _Processing your request..._",
+            **kwargs,
+        )
+    except Exception:
+        return ""
+    if msg is None:
+        return ""
+    if isinstance(msg, dict):
+        return msg.get("ts", "")
+    if hasattr(msg, "data"):
+        return msg.data.get("ts", "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # User profile helpers
 # ---------------------------------------------------------------------------
 
@@ -2499,6 +2546,9 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
 
+    # Post processing indicator immediately
+    typing_ts = await _post_processing_indicator(say, thread_ts=thread_ts)
+
     await emit("message_received", {
         "source": "dm", "channel": channel, "user_id": user_id,
         "text": text[:200], "thread_ts": thread_ts,
@@ -2578,7 +2628,22 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
             sn_url = settings.sn_instance_url
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
-            await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+            if typing_ts:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_update(
+                    channel=channel, ts=typing_ts,
+                    text=linked_text, blocks=blocks,
+                )
+            else:
+                await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+        else:
+            # Recommendations were gated — delete the typing indicator
+            if typing_ts:
+                try:
+                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    await client.chat_delete(channel=channel, ts=typing_ts)
+                except Exception:
+                    pass
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, thread_ts, settings)
@@ -2591,6 +2656,13 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
     except Exception as exc:
         logger.exception("Error processing message")
         await emit("error", {"source": "dm", "message": str(exc)[:300]})
+        # Delete the typing indicator on error
+        if typing_ts:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_delete(channel=channel, ts=typing_ts)
+            except Exception:
+                pass
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
@@ -2710,6 +2782,9 @@ async def _handle_incident_message(
     """
     channel = event["channel"]
     user_id = event.get("user", "unknown")
+
+    # Post processing indicator immediately (no thread_ts for incident channels)
+    typing_ts = await _post_processing_indicator(say)
 
     await emit("message_received", {
         "source": "incident", "channel": channel, "user_id": user_id,
@@ -2867,7 +2942,22 @@ async def _handle_incident_message(
             sn_url = settings.sn_instance_url
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
-            await say(text=linked_text, blocks=blocks)
+            if typing_ts:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_update(
+                    channel=channel, ts=typing_ts,
+                    text=linked_text, blocks=blocks,
+                )
+            else:
+                await say(text=linked_text, blocks=blocks)
+        else:
+            # Recommendations were gated — delete the typing indicator
+            if typing_ts:
+                try:
+                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    await client.chat_delete(channel=channel, ts=typing_ts)
+                except Exception:
+                    pass
 
         # Update the pinned summary message with progress
         await _update_incident_summary(channel, result.text, settings)
@@ -2917,6 +3007,13 @@ async def _handle_incident_message(
     except Exception as exc:
         logger.exception("Error processing incident channel message")
         await emit("error", {"source": "incident", "message": str(exc)[:300]})
+        # Delete the typing indicator on error
+        if typing_ts:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_delete(channel=channel, ts=typing_ts)
+            except Exception:
+                pass
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
@@ -3205,6 +3302,9 @@ async def _handle_help_channel_message(
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
 
+    # Post processing indicator immediately
+    typing_ts = await _post_processing_indicator(say, thread_ts=thread_ts)
+
     await emit("message_received", {
         "source": "help-it", "channel": channel, "user_id": user_id,
         "text": text[:200], "thread_ts": thread_ts,
@@ -3379,7 +3479,22 @@ async def _handle_help_channel_message(
         if gated_msg_ts is None:
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
-            await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+            if typing_ts:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_update(
+                    channel=channel, ts=typing_ts,
+                    text=linked_text, blocks=blocks,
+                )
+            else:
+                await say(text=linked_text, blocks=blocks, thread_ts=thread_ts)
+        else:
+            # Recommendations were gated — delete the typing indicator
+            if typing_ts:
+                try:
+                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    await client.chat_delete(channel=channel, ts=typing_ts)
+                except Exception:
+                    pass
 
         # Update user profile from conversation (fire-and-forget)
         asyncio.create_task(
@@ -3592,6 +3707,13 @@ async def _handle_help_channel_message(
     except Exception as exc:
         logger.exception("Error processing #help-it message")
         await emit("error", {"source": "help-it", "message": str(exc)[:300]})
+        # Delete the typing indicator on error
+        if typing_ts:
+            try:
+                client = AsyncWebClient(token=settings.slack_bot_token)
+                await client.chat_delete(channel=channel, ts=typing_ts)
+            except Exception:
+                pass
         blocks = format_error_blocks(
             "Something went wrong processing your request. Please try again."
         )
