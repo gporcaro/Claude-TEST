@@ -3876,6 +3876,18 @@ async def post_resolution_update(
         # Update the escalation message in #it-helpdesk to show resolved status
         ctx = _incident_context.get(channel_id, {})
         escalation_ts = ctx.get("escalation_msg_ts")
+        # If ts not cached (e.g. bot restarted), search #it-helpdesk history
+        if not escalation_ts and settings.it_helpdesk_channel_id:
+            try:
+                hist = await client.conversations_history(
+                    channel=settings.it_helpdesk_channel_id, limit=50,
+                )
+                for msg in hist.get("messages", []):
+                    if msg.get("bot_id") and f"Escalation: {ticket_id}" in msg.get("text", ""):
+                        escalation_ts = msg["ts"]
+                        break
+            except Exception:
+                logger.debug("Failed to search #it-helpdesk for escalation message", exc_info=True)
         if escalation_ts and settings.it_helpdesk_channel_id:
             close_notes = ticket_data.get("close_notes", "")
             updated_text = f":white_check_mark: ~*Escalation: {ticket_id}*~ — *Resolved*"
