@@ -148,7 +148,8 @@ outage or external service issue that IT cannot resolve internally (e.g., a SaaS
 down, an ISP outage, a vendor patch is needed), call `update_ticket` with `status="on_hold"`
 and a `comment` explaining the vendor dependency (e.g., "On hold — awaiting Okta service
 restoration"). Inform the user that the issue is with an external vendor and that IT is
-monitoring the situation.
+monitoring the situation. When describing this to the user, say the ticket State has been set
+to "On Hold" (not "waiting" or "status").
 
 When responding in the #help-it channel:
 - Be proactive: acknowledge the issue immediately and begin troubleshooting.
