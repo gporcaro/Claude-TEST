@@ -4279,10 +4279,13 @@ async def post_resolution_update(
             except Exception:
                 logger.debug("Failed to search #it-helpdesk for escalation message", exc_info=True)
         if escalation_ts and settings.it_helpdesk_channel_id:
+            title = ticket_data.get("title", "")
             close_notes = ticket_data.get("close_notes", "")
             updated_text = f":white_check_mark: ~*Escalation: {ticket_id}*~ — *Resolved*"
+            if title:
+                updated_text += f"\n*Short description:* {title}"
             if close_notes:
-                updated_text += f"\n>_{close_notes}_"
+                updated_text += f"\n*Closure notes:* {close_notes}"
             updated_text = linkify_servicenow_refs(updated_text, settings.sn_instance_url)
             try:
                 await client.chat_update(
