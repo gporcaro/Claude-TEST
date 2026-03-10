@@ -711,6 +711,37 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 await _handle_incident_message(event, text, say, settings)
                 return
 
+            # Fallback: private channel not yet registered (e.g. created
+            # right before a bot restart and missed by discovery).  Look up
+            # the channel name and, if it matches the incident pattern,
+            # register it on the fly so the conversation can continue.
+            if channel_type == "group" and channel not in _incident_channels:
+                try:
+                    _client = AsyncWebClient(token=settings.slack_bot_token)
+                    _info = await _client.conversations_info(channel=channel)
+                    _ch_name = _info.get("channel", {}).get("name", "")
+                    _tid = _ticket_id_from_channel_name(_ch_name)
+                    if _tid:
+                        _incident_channels.add(channel)
+                        if channel not in _incident_context:
+                            _incident_context[channel] = {
+                                "ticket_id": _tid,
+                                "title": "",
+                                "description": "",
+                                "priority": "",
+                                "summary_ts": None,
+                                "original_text": None,
+                                "summary_lines": [],
+                            }
+                        logger.info(
+                            "Late-registered incident channel %s (%s) for %s",
+                            channel, _ch_name, _tid,
+                        )
+                        await _handle_incident_message(event, text, say, settings)
+                        return
+                except Exception:
+                    logger.debug("Failed late-discovery for channel %s", channel, exc_info=True)
+
             # Refinement threads in #it-helpdesk
             thread_ts = event.get("thread_ts", "")
             if (
