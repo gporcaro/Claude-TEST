@@ -698,6 +698,20 @@ async def get_expired_collaborative_reviews(older_than_minutes: int = 30) -> lis
     return [dict(r) for r in rows]
 
 
+async def get_pending_collaborative_reviews() -> list[dict]:
+    """Return all pending collaborative reviews that have a helpdesk message TS."""
+    if _db is None:
+        return []
+    cursor = await _db.execute(
+        """SELECT * FROM collaborative_reviews
+           WHERE status = 'pending'
+             AND helpdesk_message_ts IS NOT NULL
+             AND helpdesk_message_ts != ''""",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # User profiles
 # ---------------------------------------------------------------------------

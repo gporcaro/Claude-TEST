@@ -104,6 +104,10 @@ _debug_channel_id: str | None = None
 # Active refinement threads: (helpdesk_channel, approval_message_ts) → approval_id
 _active_refinements: dict[tuple[str, str], int] = {}
 
+# Active collaborative review refinement threads:
+# (helpdesk_channel, helpdesk_message_ts) → review_id
+_active_collab_refinements: dict[tuple[str, str], int] = {}
+
 # Channels already checked and confirmed as non-incident (skip API calls)
 _non_incident_channels: set[str] = set()
 
@@ -712,6 +716,34 @@ async def discover_incident_channels(settings: Settings) -> None:
     except Exception:
         logger.warning("Failed to discover incident channels", exc_info=True)
 
+    # Recover pending collaborative reviews so thread replies are handled
+    try:
+        pending_reviews = await db.get_pending_collaborative_reviews()
+        for r in pending_reviews:
+            review_id = r["id"]
+            helpdesk_ts = r.get("helpdesk_message_ts", "")
+            if settings.it_helpdesk_channel_id and helpdesk_ts:
+                collab_key = (settings.it_helpdesk_channel_id, helpdesk_ts)
+                _active_collab_refinements[collab_key] = review_id
+                _conversations[collab_key] = [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"Here is the original response that needs review:\n\n"
+                            f"{r['original_response']}\n\n"
+                            f"You can reply in this thread to refine the response "
+                            f"before sending it to the user."
+                        ),
+                    },
+                ]
+        if pending_reviews:
+            logger.info(
+                "Recovered %d pending collaborative review(s) for thread tracking",
+                len(pending_reviews),
+            )
+    except Exception:
+        logger.debug("Failed to recover pending collaborative reviews", exc_info=True)
+
 
 def register_handlers(app: AsyncApp, settings: Settings) -> None:
     """Register Slack event handlers."""
@@ -819,16 +851,19 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                     except Exception:
                         logger.debug("Failed late-discovery for channel %s", channel, exc_info=True)
 
-            # Refinement threads in #it-helpdesk
+            # Refinement / collaborative-review threads in #it-helpdesk
             thread_ts = event.get("thread_ts", "")
             if (
                 settings.it_helpdesk_channel_id
                 and channel == settings.it_helpdesk_channel_id
                 and thread_ts
-                and (channel, thread_ts) in _active_refinements
             ):
-                await _handle_refinement_message(event, text, settings)
-                return
+                if (channel, thread_ts) in _active_refinements:
+                    await _handle_refinement_message(event, text, settings)
+                    return
+                if (channel, thread_ts) in _active_collab_refinements:
+                    await _handle_collab_refinement_message(event, text, settings)
+                    return
 
             # Other channels → ignore (handled by app_mention only)
         finally:
@@ -1509,6 +1544,177 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         """Legacy handler — button removed, but ack any stale clicks."""
         await ack()
 
+    # --- Collaborative review thread refinement ---
+
+    async def _handle_collab_refinement_message(
+        event: dict, text: str, settings: Settings,
+    ) -> None:
+        """Handle a thread reply to a collaborative review in #it-helpdesk.
+
+        Runs the agent with REFINEMENT_SYSTEM_PROMPT, stores the refined text,
+        and posts the result with Send / Continue buttons.
+        """
+        channel = event.get("channel", "")
+        thread_ts = event.get("thread_ts", "")
+        key = (channel, thread_ts)
+
+        review_id = _active_collab_refinements.get(key)
+        if review_id is None:
+            return
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            # Review already resolved — stop tracking
+            _active_collab_refinements.pop(key, None)
+            _conversations.pop(key, None)
+            return
+
+        # Append engineer's message to conversation
+        conv = _conversations.setdefault(key, [])
+        conv.append({"role": "user", "content": text})
+        _conversation_last_active[key] = time.time()
+
+        # Run the agent with the refinement system prompt (no tools)
+        agent = _get_agent(settings)
+        try:
+            result = await agent.run(
+                messages=conv,
+                system_prompt=REFINEMENT_SYSTEM_PROMPT,
+            )
+        except Exception:
+            logger.warning("Collab refinement agent call failed", exc_info=True)
+            return
+
+        # Store the refined text
+        conv.append({"role": "assistant", "content": result.text})
+        await db.update_collaborative_review(
+            review_id, modified_response=result.text,
+        )
+
+        # Post the response + Send/Continue buttons in thread
+        client = _slack_client
+        try:
+            response_blocks = format_response_blocks(result.text, settings.sn_instance_url)
+            send_blocks = [
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Send to User"},
+                            "action_id": "collab_send_refined",
+                            "value": str(review_id),
+                            "style": "primary",
+                        },
+                    ],
+                },
+            ]
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=result.text,
+                blocks=response_blocks + send_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to post collab refinement response", exc_info=True)
+
+    @app.action("collab_send_refined")
+    async def handle_collab_send_refined(ack, body) -> None:
+        """Send the refined collaborative review response to the user."""
+        await ack()
+        review_id = int(body["actions"][0]["value"])
+        sender_id = body["user"]["id"]
+        sender_name = await _resolve_user_name(sender_id, settings)
+
+        review = await db.get_collaborative_review(review_id)
+        if not review or review["status"] != "pending":
+            return
+
+        refined_text = review.get("modified_response")
+        if not refined_text:
+            return
+
+        await db.update_collaborative_review(
+            review_id,
+            status="modified",
+            resolved_by=sender_name,
+        )
+
+        # Update user's placeholder with the refined response
+        try:
+            client = _slack_client
+            sn_url = settings.sn_instance_url
+            blocks = format_response_blocks(refined_text, sn_url)
+            linked = linkify_servicenow_refs(refined_text, sn_url)
+            await client.chat_update(
+                channel=review["channel_id"],
+                ts=review["placeholder_message_ts"],
+                text=linked,
+                blocks=blocks,
+            )
+            thread = review.get("thread_ts", "")
+            if thread:
+                await client.chat_postMessage(
+                    channel=review["channel_id"],
+                    thread_ts=thread,
+                    text=(
+                        ":white_check_mark: The response for this issue has been "
+                        "reviewed, refined, and approved by IT. "
+                        "Please see the updated message above."
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to update user message on collab send refined", exc_info=True)
+
+        # Update the #it-helpdesk main review message with summary
+        helpdesk_ts = review.get("helpdesk_message_ts")
+        if helpdesk_ts and settings.it_helpdesk_channel_id:
+            try:
+                client = _slack_client
+                summary_line = await _build_collab_decision_line(
+                    ":pencil2:", "refined and sent", sender_name, review, settings,
+                )
+                await client.chat_update(
+                    channel=settings.it_helpdesk_channel_id,
+                    ts=helpdesk_ts, text=summary_line,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_line}}],
+                )
+            except Exception:
+                logger.debug("Failed to update collab refined helpdesk message", exc_info=True)
+
+        # Clean up tracking state
+        for key, rid in list(_active_collab_refinements.items()):
+            if rid == review_id:
+                _active_collab_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
+
+        # Dismiss Send button and show confirmation
+        try:
+            client = _slack_client
+            msg = body.get("message", {})
+            original_blocks = msg.get("blocks", [])
+            text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            text_blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: Refined response sent to the user.",
+                },
+            })
+            await client.chat_update(
+                channel=body["channel"]["id"],
+                ts=msg["ts"],
+                text=msg.get("text", ""),
+                blocks=text_blocks,
+            )
+        except Exception:
+            logger.debug("Failed to dismiss collab send refined buttons", exc_info=True)
+
+        await emit("collab_review_refined", {
+            "review_id": review_id, "sender": sender_name,
+        })
+
     # --- Collaborative review actions ---
 
     async def _build_collab_decision_line(
@@ -1598,6 +1804,13 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             )
         except Exception:
             logger.debug("Failed to update collab approval message", exc_info=True)
+
+        # Clean up refinement tracking if active
+        for key, rid in list(_active_collab_refinements.items()):
+            if rid == review_id:
+                _active_collab_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
 
         await emit("collab_review_approved", {
             "review_id": review_id, "approver": approver_name,
@@ -1707,6 +1920,13 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             except Exception:
                 logger.debug("Failed to update collab modify helpdesk message", exc_info=True)
 
+        # Clean up refinement tracking if active
+        for key, rid in list(_active_collab_refinements.items()):
+            if rid == review_id:
+                _active_collab_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
+
         await emit("collab_review_modified", {
             "review_id": review_id, "modifier": modifier_name,
         })
@@ -1782,6 +2002,13 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             )
         except Exception:
             logger.debug("Failed to update collab takeover message", exc_info=True)
+
+        # Clean up refinement tracking if active
+        for key, rid in list(_active_collab_refinements.items()):
+            if rid == review_id:
+                _active_collab_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
 
         await emit("collab_review_takeover", {
             "review_id": review_id, "taken_over_by": takeover_name,
@@ -2551,6 +2778,26 @@ async def _open_collaborative_review(
                 review_id,
                 helpdesk_message_ts=helpdesk_ts,
             )
+
+            # Register the thread for refinement so thread replies are handled
+            if helpdesk_ts:
+                collab_key = (settings.it_helpdesk_channel_id, helpdesk_ts)
+                _active_collab_refinements[collab_key] = review_id
+                _conversations[collab_key] = [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"Here is the original response that needs review:\n\n"
+                            f"{response_text}\n\n"
+                            f"You can reply in this thread to refine the response "
+                            f"before sending it to the user."
+                        ),
+                    },
+                ]
+                logger.info(
+                    "Registered collab review %d thread (%s) for refinement",
+                    review_id, helpdesk_ts,
+                )
         except Exception:
             logger.warning("Failed to post collaborative review to #it-helpdesk", exc_info=True)
 
@@ -4749,6 +4996,13 @@ async def _process_expired_collaborative_reviews(settings: Settings) -> None:
                     "Failed to update helpdesk message for timed-out review %d",
                     review_id, exc_info=True,
                 )
+
+        # Clean up refinement tracking if active
+        for key, rid in list(_active_collab_refinements.items()):
+            if rid == review_id:
+                _active_collab_refinements.pop(key, None)
+                _conversations.pop(key, None)
+                break
 
         await emit("collab_review_timed_out", {"review_id": review_id})
 
