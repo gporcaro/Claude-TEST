@@ -1935,6 +1935,12 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         channel_id = result["channel_id"]
 
+        # If the ticket is already on_hold, append -onhold to the new channel
+        _safe_create_task(
+            _rename_if_on_hold(ticket_id, settings),
+            name=f"rename_if_onhold_{ticket_id}",
+        )
+
         # Replace the button with confirmation + link (single message, no extras)
         try:
             await client.chat_update(
@@ -4234,6 +4240,21 @@ async def _rename_incident_channel_active(
         logger.info("Renamed incident channel %s → %s", current_name, new_name)
     except Exception:
         logger.warning("Failed to strip on-hold suffix from channel %s", channel_id, exc_info=True)
+
+
+async def _rename_if_on_hold(ticket_id: str, settings: Settings) -> None:
+    """Check if *ticket_id* is on_hold in ServiceNow and rename its channel accordingly."""
+    sn_client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password
+    )
+    try:
+        incident = await sn_client.get_incident(ticket_id)
+        if incident and incident.get("status") == "on_hold":
+            await _rename_incident_channel_on_hold(ticket_id, _slack_client)
+    except Exception:
+        logger.warning("Failed to check on-hold status for %s", ticket_id, exc_info=True)
+    finally:
+        await sn_client.close()
 
 
 def _prune_stale_conversations() -> None:
