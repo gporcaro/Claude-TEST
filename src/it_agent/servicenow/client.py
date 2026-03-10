@@ -22,7 +22,7 @@ _URGENCY_TO_PRIORITY: dict[str, str] = {
 _STATUS_TO_STATE: dict[str, str] = {
     "open": "1",
     "in_progress": "2",
-    "waiting": "3",
+    "on_hold": "3",
     "resolved": "6",
     "closed": "7",
 }
@@ -30,7 +30,7 @@ _STATUS_TO_STATE: dict[str, str] = {
 _STATE_TO_STATUS: dict[str, str] = {
     "1": "open",
     "2": "in_progress",
-    "3": "waiting",
+    "3": "on_hold",
     "6": "resolved",
     "7": "closed",
 }

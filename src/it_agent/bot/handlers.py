@@ -69,6 +69,15 @@ _pending_channels: dict[str, dict] = {}
 # Resolved tickets pending auto-close: ticket_id → resolved_epoch
 _resolved_pending_close: dict[str, float] = {}
 
+# Tickets awaiting user response: ticket_id → epoch when bot last responded
+_awaiting_user_response: dict[str, float] = {}
+
+# How long to wait before setting on_hold (5 minutes)
+_ON_HOLD_DELAY = 5 * 60
+
+# How often to check for on_hold candidates (1 minute)
+_ON_HOLD_CHECK_INTERVAL = 60
+
 # Debounced live-summary timers: ticket_id → pending asyncio.Task
 _summary_timers: dict[str, asyncio.Task] = {}
 
@@ -2850,6 +2859,18 @@ async def _handle_incident_message(
     channel = event["channel"]
     user_id = event.get("user", "unknown")
 
+    # Cancel on-hold timer and resume if ticket was on hold
+    ctx = _incident_context.get(channel, {})
+    _hold_tid = ctx.get("ticket_id")
+    if _hold_tid:
+        was_pending = _awaiting_user_response.pop(_hold_tid, None)
+        if was_pending is None:
+            # Timer already fired → ticket may be on_hold in SN, resume it
+            _safe_create_task(
+                _resume_from_on_hold(_hold_tid, settings),
+                name=f"resume_on_hold_{_hold_tid}",
+            )
+
     # Post processing indicator immediately (no thread_ts for incident channels)
     typing_ts = await _post_processing_indicator(say)
 
@@ -3040,6 +3061,12 @@ async def _handle_incident_message(
 
         # Post public article feedback buttons + approval requests
         await _post_public_article_followups(result, channel, None, settings)
+
+        # Track awaiting-user-response for on_hold timer
+        ctx = _incident_context.get(channel, {})
+        _tid = ctx.get("ticket_id")
+        if _tid and _tid not in _resolved_pending_close:
+            _awaiting_user_response[_tid] = time.time()
 
         # Update user profile from conversation (fire-and-forget)
         _safe_create_task(
@@ -3378,6 +3405,17 @@ async def _handle_help_channel_message(
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
 
+    # Cancel on-hold timer and resume if ticket was on hold
+    for _tid, (_ch, _ts) in _ticket_threads.items():
+        if _ch == channel and _ts == thread_ts:
+            was_pending = _awaiting_user_response.pop(_tid, None)
+            if was_pending is None:
+                _safe_create_task(
+                    _resume_from_on_hold(_tid, settings),
+                    name=f"resume_on_hold_{_tid}",
+                )
+            break
+
     # Post processing indicator immediately
     typing_ts = await _post_processing_indicator(say, thread_ts=thread_ts)
 
@@ -3576,6 +3614,13 @@ async def _handle_help_channel_message(
             _update_user_profile_from_conversation(history, user_id, settings),
             name="profile_update_helpit",
         )
+
+        # Track awaiting-user-response for on_hold timer
+        for _tid, (_ch, _ts) in _ticket_threads.items():
+            if _ch == channel and _ts == thread_ts:
+                if _tid not in _resolved_pending_close:
+                    _awaiting_user_response[_tid] = time.time()
+                break
 
         # ── Post ticket follow-up with "Move to private channel" button ──
         if auto_ticket_info and auto_ticket_info.get("success"):
@@ -4203,6 +4248,78 @@ async def _auto_close_ticket(
     _incident_channels.discard(channel_id)
     _incident_context.pop(channel_id, None)
     _ticket_to_channel.pop(ticket_id, None)
+
+
+# ---------------------------------------------------------------------------
+# On-hold background loop
+# ---------------------------------------------------------------------------
+
+
+async def start_on_hold_loop(settings: Settings) -> None:
+    """Background loop that sets tickets to on_hold after 5 min of no user response."""
+    while True:
+        try:
+            await _process_pending_on_holds(settings)
+        except Exception:
+            logger.warning("On-hold loop iteration failed", exc_info=True)
+        await asyncio.sleep(_ON_HOLD_CHECK_INTERVAL)
+
+
+async def _process_pending_on_holds(settings: Settings) -> None:
+    """Check for tickets awaiting user response for > 5 min and set them on_hold."""
+    now = time.time()
+    ready = [
+        tid for tid, responded_at in _awaiting_user_response.items()
+        if now - responded_at >= _ON_HOLD_DELAY
+    ]
+    if not ready:
+        return
+
+    sn_client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password
+    )
+    try:
+        for ticket_id in ready:
+            try:
+                incident = await sn_client.get_incident(ticket_id)
+                if incident is None:
+                    _awaiting_user_response.pop(ticket_id, None)
+                    continue
+                # Only set on_hold if ticket is still open/in_progress
+                if incident.get("status") not in ("open", "in_progress"):
+                    _awaiting_user_response.pop(ticket_id, None)
+                    continue
+                await sn_client.update_incident(
+                    incident["sys_id"],
+                    {"status": "on_hold", "comment": "Awaiting user response."},
+                    current_state=incident.get("_raw_state", "2"),
+                )
+                logger.info("Set ticket %s to on_hold (awaiting user response)", ticket_id)
+            except Exception:
+                logger.warning("Failed to set %s to on_hold", ticket_id, exc_info=True)
+            _awaiting_user_response.pop(ticket_id, None)
+    finally:
+        await sn_client.close()
+
+
+async def _resume_from_on_hold(ticket_id: str, settings: Settings) -> None:
+    """If ticket is currently on_hold in ServiceNow, move it back to in_progress."""
+    sn_client = ServiceNowClient(
+        settings.sn_instance_url, settings.sn_username, settings.sn_password
+    )
+    try:
+        incident = await sn_client.get_incident(ticket_id)
+        if incident and incident.get("status") == "on_hold":
+            await sn_client.update_incident(
+                incident["sys_id"],
+                {"status": "in_progress", "comment": "User responded — resuming."},
+                current_state=incident.get("_raw_state", "3"),
+            )
+            logger.info("Resumed ticket %s from on_hold to in_progress", ticket_id)
+    except Exception:
+        logger.warning("Failed to resume %s from on_hold", ticket_id, exc_info=True)
+    finally:
+        await sn_client.close()
 
 
 # ---------------------------------------------------------------------------

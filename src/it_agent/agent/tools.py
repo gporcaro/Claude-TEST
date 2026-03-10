@@ -132,7 +132,7 @@ TOOLS = [
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["open", "in_progress", "waiting", "resolved", "closed"],
+                    "enum": ["open", "in_progress", "on_hold", "resolved", "closed"],
                 },
                 "priority": {
                     "type": "string",
@@ -172,7 +172,7 @@ TOOLS = [
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["open", "in_progress", "waiting", "resolved", "closed"],
+                    "enum": ["open", "in_progress", "on_hold", "resolved", "closed"],
                     "description": "Filter by status",
                 },
                 "priority": {
