@@ -40,10 +40,15 @@ logger = logging.getLogger(__name__)
 
 # Per-thread conversation history: {(channel, thread_ts): [messages]}
 _conversations: dict[tuple[str, str], list[dict]] = {}
+# Last activity timestamp for each conversation (for pruning)
+_conversation_last_active: dict[tuple[str, str], float] = {}
 MAX_HISTORY = 20
 
 # Shared agent instance
 _agent: Agent | None = None
+
+# Shared Slack client — initialized once via init_shared_clients()
+_slack_client: AsyncWebClient | None = None
 
 # Tracks ticket → original #help-it thread so we can post resolution updates.
 # ticket_id → (channel, thread_ts)
@@ -54,6 +59,9 @@ _incident_channels: set[str] = set()
 
 # Per-incident-channel context: channel_id → {ticket_id, title, description, ...}
 _incident_context: dict[str, dict] = {}
+
+# Reverse index: ticket_id → channel_id (kept in sync with _incident_context)
+_ticket_to_channel: dict[str, str] = {}
 
 # Pending channel creation: ticket_id → {user_id, ticket, thread_ts, channel}
 _pending_channels: dict[str, dict] = {}
@@ -87,10 +95,32 @@ _debug_channel_id: str | None = None
 # Active refinement threads: (helpdesk_channel, approval_message_ts) → approval_id
 _active_refinements: dict[tuple[str, str], int] = {}
 
+# Channels already checked and confirmed as non-incident (skip API calls)
+_non_incident_channels: set[str] = set()
+
 # Deduplication: track message timestamps currently being processed to prevent
 # the same Slack event from being handled concurrently (e.g. Socket Mode retries
 # that arrive while an earlier delivery is still awaiting an API call).
 _processing_messages: set[str] = set()
+
+
+def _safe_create_task(coro, name: str = "") -> asyncio.Task:
+    """Create an asyncio task with exception logging."""
+    task = asyncio.create_task(coro)
+    def _on_done(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("Background task %s failed: %s", name or t.get_name(), exc, exc_info=exc)
+    task.add_done_callback(_on_done)
+    return task
+
+
+def init_shared_clients(settings: Settings) -> None:
+    """Initialize shared clients. Call before other handlers functions."""
+    global _slack_client
+    _slack_client = AsyncWebClient(token=settings.slack_bot_token)
 
 
 async def load_ai_context_articles(settings: Settings) -> None:
@@ -124,7 +154,7 @@ async def resolve_debug_channel(settings: Settings) -> None:
         return
 
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         cursor = None
         while True:
             kwargs: dict = {"types": "public_channel,private_channel", "limit": 200}
@@ -227,7 +257,7 @@ async def _post_debug_summary(
     if not _debug_channel_id:
         return
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
 
         # Build thread permalink
         thread_link = ""
@@ -306,7 +336,7 @@ def _get_agent(settings: Settings) -> Agent:
 async def _resolve_user_name(user_id: str, settings: Settings) -> str:
     """Best-effort resolve Slack user_id to display name."""
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         info = await client.users_info(user=user_id)
         profile = info["user"]["profile"]
         return profile.get("display_name") or profile.get("real_name") or user_id
@@ -352,7 +382,7 @@ async def _recover_thread_history(
     Returns a list of ``{role, content}`` dicts ready for the agent.
     """
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
 
         # Resolve bot's own user ID so we can tag its messages as "assistant"
         if bot_user_id is None:
@@ -504,7 +534,7 @@ def _find_incident_channel_for_thread(channel: str, thread_ts: str) -> str | Non
     """Reverse-lookup: find the incident channel associated with a #help-it thread.
 
     Walks _ticket_threads to find the ticket_id for (channel, thread_ts),
-    then walks _incident_context to find the channel_id for that ticket.
+    then uses _ticket_to_channel to find the channel_id for that ticket.
     """
     ticket_id: str | None = None
     for tid, (ch, ts) in _ticket_threads.items():
@@ -513,10 +543,7 @@ def _find_incident_channel_for_thread(channel: str, thread_ts: str) -> str | Non
             break
     if ticket_id is None:
         return None
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            return ch_id
-    return None
+    return _ticket_to_channel.get(ticket_id)
 
 
 async def discover_incident_channels(settings: Settings) -> None:
@@ -525,7 +552,7 @@ async def discover_incident_channels(settings: Settings) -> None:
     Also fetches the first bot message in each channel to seed incident context.
     """
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         cursor = None
         channel_ids: list[str] = []
         while True:
@@ -569,6 +596,7 @@ async def discover_incident_channels(settings: Settings) -> None:
                             "original_text": original,
                             "summary_lines": [],
                         }
+                        _ticket_to_channel[ctx["ticket_id"]] = ch_id
                         found = True
                         break
 
@@ -585,6 +613,7 @@ async def discover_incident_channels(settings: Settings) -> None:
                             "original_text": None,
                             "summary_lines": [],
                         }
+                        _ticket_to_channel[ticket_id] = ch_id
                         logger.info(
                             "Seeded incident context for %s from channel name (%s)",
                             ch_name, ticket_id,
@@ -716,31 +745,34 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             # the channel name and, if it matches the incident pattern,
             # register it on the fly so the conversation can continue.
             if channel_type == "group" and channel not in _incident_channels:
-                try:
-                    _client = AsyncWebClient(token=settings.slack_bot_token)
-                    _info = await _client.conversations_info(channel=channel)
-                    _ch_name = _info.get("channel", {}).get("name", "")
-                    _tid = _ticket_id_from_channel_name(_ch_name)
-                    if _tid:
-                        _incident_channels.add(channel)
-                        if channel not in _incident_context:
-                            _incident_context[channel] = {
-                                "ticket_id": _tid,
-                                "title": "",
-                                "description": "",
-                                "priority": "",
-                                "summary_ts": None,
-                                "original_text": None,
-                                "summary_lines": [],
-                            }
-                        logger.info(
-                            "Late-registered incident channel %s (%s) for %s",
-                            channel, _ch_name, _tid,
-                        )
-                        await _handle_incident_message(event, text, say, settings)
-                        return
-                except Exception:
-                    logger.debug("Failed late-discovery for channel %s", channel, exc_info=True)
+                if channel not in _non_incident_channels:
+                    try:
+                        _info = await _slack_client.conversations_info(channel=channel)
+                        _ch_name = _info.get("channel", {}).get("name", "")
+                        _tid = _ticket_id_from_channel_name(_ch_name)
+                        if _tid:
+                            _incident_channels.add(channel)
+                            if channel not in _incident_context:
+                                _incident_context[channel] = {
+                                    "ticket_id": _tid,
+                                    "title": "",
+                                    "description": "",
+                                    "priority": "",
+                                    "summary_ts": None,
+                                    "original_text": None,
+                                    "summary_lines": [],
+                                }
+                                _ticket_to_channel[_tid] = channel
+                            logger.info(
+                                "Late-registered incident channel %s (%s) for %s",
+                                channel, _ch_name, _tid,
+                            )
+                            await _handle_incident_message(event, text, say, settings)
+                            return
+                        else:
+                            _non_incident_channels.add(channel)
+                    except Exception:
+                        logger.debug("Failed late-discovery for channel %s", channel, exc_info=True)
 
             # Refinement threads in #it-helpdesk
             thread_ts = event.get("thread_ts", "")
@@ -790,7 +822,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
                 logger.info("Article %s promoted to trusted (score %d)", article_id, updated["confidence_score"])
             # Update the message to acknowledge the vote
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 pos = updated["positive_votes"]
                 neg = updated["negative_votes"]
                 await client.chat_update(
@@ -810,7 +842,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         updated = await db.record_feedback(int(article_id), user_id, "not_helpful")
         if updated:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 pos = updated["positive_votes"]
                 neg = updated["negative_votes"]
                 await client.chat_update(
@@ -844,7 +876,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the approval message
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             article = await db.get_public_article(article_id)
             title = article["title"] if article else f"Article {article_id}"
             await client.chat_update(
@@ -875,7 +907,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the approval message
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             article = await db.get_public_article(article_id)
             title = article["title"] if article else f"Article {article_id}"
             await client.chat_update(
@@ -922,7 +954,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         conv_thread = approval.get("thread_ts", "")
         if conv_channel:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 msg_ts = conv_thread or approval.get("message_ts", "")
                 if msg_ts:
                     link_resp = await client.chat_getPermalink(
@@ -974,7 +1006,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Deliver the approved response
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             sn_url = settings.sn_instance_url
             original = approval["original_text"]
             linked = linkify_servicenow_refs(original, sn_url)
@@ -1017,7 +1049,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the #it-helpdesk approval message with summary + link
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             ch = approval.get("approval_channel") or body["channel"]["id"]
             ts = approval.get("approval_message_ts") or body["message"]["ts"]
             summary_line = await _build_rec_decision_line(
@@ -1078,7 +1110,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the user's message with escalation notice
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             denial_text = (
                 f"{approval['redacted_text'].rsplit(':hourglass_flowing_sand:', 1)[0].rstrip()}"
                 "\n\n:rotating_light: _The troubleshooting steps have been reviewed by IT. "
@@ -1108,7 +1140,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the #it-helpdesk message with summary + link
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             ch = approval.get("approval_channel") or body["channel"]["id"]
             ts = approval.get("approval_message_ts") or body["message"]["ts"]
             summary_line = await _build_rec_decision_line(
@@ -1146,7 +1178,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         await db.update_pending_rec_approval(approval_id, status="refining")
 
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         ch = approval.get("approval_channel") or body["channel"]["id"]
         ts = approval.get("approval_message_ts") or body["message"]["ts"]
 
@@ -1250,6 +1282,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         # Append engineer's message to conversation
         conv = _conversations.setdefault(key, [])
         conv.append({"role": "user", "content": text})
+        _conversation_last_active[key] = time.time()
 
         # Run the agent with the refinement system prompt (no tools)
         agent = _get_agent(settings)
@@ -1267,7 +1300,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         await db.update_pending_rec_approval(approval_id, refined_text=result.text)
 
         # Post the response + Send/Continue buttons in thread
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         try:
             response_blocks = format_response_blocks(result.text, settings.sn_instance_url)
             send_blocks = format_refinement_send_button(approval_id)
@@ -1315,7 +1348,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Deliver the refined response
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             sn_url = settings.sn_instance_url
             linked = linkify_servicenow_refs(refined_text, sn_url)
             blocks = format_response_blocks(refined_text, sn_url)
@@ -1357,7 +1390,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the #it-helpdesk approval message with summary
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             ch = approval.get("approval_channel") or body["channel"]["id"]
             ts = approval.get("approval_message_ts") or body["message"]["ts"]
             summary_line = await _build_rec_decision_line(
@@ -1386,7 +1419,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         # Dismiss Send/Continue buttons and show confirmation with nav link
         link_text = ""
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             conv_channel = approval.get("channel_id", "")
             conv_thread = approval.get("thread_ts", "")
             if conv_thread and conv_channel:
@@ -1402,7 +1435,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             logger.debug("Failed to build nav link for refined recommendation", exc_info=True)
 
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             msg = body.get("message", {})
             original_blocks = msg.get("blocks", [])
             text_blocks = [b for b in original_blocks if b.get("type") != "actions"]
@@ -1447,7 +1480,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         conv_thread = review.get("thread_ts", "")
         if conv_channel:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 msg_ts = conv_thread or review.get("placeholder_message_ts", "")
                 if msg_ts:
                     link_resp = await client.chat_getPermalink(
@@ -1481,7 +1514,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update user's placeholder message with the full original response
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             sn_url = settings.sn_instance_url
             original = review["original_response"]
             blocks = format_response_blocks(original, sn_url)
@@ -1508,7 +1541,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update the #it-helpdesk message with summary + link
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             ch = body["channel"]["id"]
             ts = body["message"]["ts"]
             summary_line = await _build_collab_decision_line(
@@ -1537,7 +1570,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Open a Slack modal pre-filled with the original response
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             await client.views_open(
                 trigger_id=trigger_id,
                 view={
@@ -1590,7 +1623,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update user's placeholder with the modified response
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             sn_url = settings.sn_instance_url
             blocks = format_response_blocks(modified_text, sn_url)
             linked = linkify_servicenow_refs(modified_text, sn_url)
@@ -1617,7 +1650,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         helpdesk_ts = review.get("helpdesk_message_ts")
         if helpdesk_ts and settings.it_helpdesk_channel_id:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 summary_line = await _build_collab_decision_line(
                     ":pencil2:", "modified and sent", modifier_name, review, settings,
                 )
@@ -1650,7 +1683,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
 
         # Update user's placeholder to indicate takeover
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             takeover_text = (
                 ":bust_in_silhouette: _A Support Agent is taking over this issue. "
                 "They'll be with you shortly._"
@@ -1679,21 +1712,20 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             # If an incident channel exists for this ticket, invite IT staff
             ticket_id = review.get("ticket_id", "")
             if ticket_id:
-                for ch_id, ctx in _incident_context.items():
-                    if ctx.get("ticket_id") == ticket_id:
-                        try:
-                            await client.conversations_invite(
-                                channel=ch_id, users=takeover_id,
-                            )
-                        except Exception:
-                            pass  # already_in_channel or other
-                        break
+                inc_ch = _ticket_to_channel.get(ticket_id)
+                if inc_ch:
+                    try:
+                        await client.conversations_invite(
+                            channel=inc_ch, users=takeover_id,
+                        )
+                    except Exception:
+                        pass  # already_in_channel or other
         except Exception:
             logger.debug("Failed to update user message on collab takeover", exc_info=True)
 
         # Update the #it-helpdesk message with summary + link
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             ch = body["channel"]["id"]
             ts = body["message"]["ts"]
             summary_line = await _build_collab_decision_line(
@@ -1720,7 +1752,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         creator_name = await _resolve_user_name(creator_id, settings)
 
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             await client.chat_update(
                 channel=body["channel"]["id"],
                 ts=body["message"]["ts"],
@@ -1747,7 +1779,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         dismisser_name = await _resolve_user_name(dismisser_id, settings)
 
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             await client.chat_update(
                 channel=body["channel"]["id"],
                 ts=body["message"]["ts"],
@@ -1774,7 +1806,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         thread_ts = body["message"].get("thread_ts") or message_ts
         button_user_id = body["user"]["id"]
 
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
 
         # Parse ticket_id and requester from button value (format: "INC...:U...")
         if ":" in raw_value:
@@ -1813,30 +1845,30 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
             return
 
         # Check if channel already exists (idempotent)
-        for ch_id, ctx in _incident_context.items():
-            if ctx.get("ticket_id") == ticket_id:
-                # Ensure the clicker is in the channel
-                try:
-                    await client.conversations_invite(channel=ch_id, users=button_user_id)
-                except Exception:
-                    pass  # already_in_channel or other — not critical
-                # Replace button with confirmation + link
-                try:
-                    await client.chat_update(
-                        channel=channel,
-                        ts=message_ts,
-                        text=f":white_check_mark: *{ticket_id}* — Head over to <#{ch_id}> to continue.",
-                        blocks=[{
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f":white_check_mark: *{ticket_id}* — Head over to <#{ch_id}> to continue.",
-                            },
-                        }],
-                    )
-                except Exception:
-                    logger.debug("Failed to update button message", exc_info=True)
-                return
+        existing_ch = _ticket_to_channel.get(ticket_id)
+        if existing_ch:
+            # Ensure the clicker is in the channel
+            try:
+                await client.conversations_invite(channel=existing_ch, users=button_user_id)
+            except Exception:
+                pass  # already_in_channel or other — not critical
+            # Replace button with confirmation + link
+            try:
+                await client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text=f":white_check_mark: *{ticket_id}* — Head over to <#{existing_ch}> to continue.",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f":white_check_mark: *{ticket_id}* — Head over to <#{existing_ch}> to continue.",
+                        },
+                    }],
+                )
+            except Exception:
+                logger.debug("Failed to update button message", exc_info=True)
+            return
 
         # Create the channel
         result = await _create_deferred_channel(
@@ -1885,7 +1917,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         message_ts = body["message"]["ts"]
         button_user_id = body["user"]["id"]
 
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
 
         # Update button message to show processing
         try:
@@ -1964,6 +1996,7 @@ def register_handlers(app: AsyncApp, settings: Settings) -> None:
         _resolved_pending_close.pop(ticket_id, None)
         _incident_channels.discard(channel)
         _incident_context.pop(channel, None)
+        _ticket_to_channel.pop(ticket_id, None)
 
         # 6. Emit events
         await emit("ticket_auto_closed", {"ticket_id": ticket_id, "channel_id": channel})
@@ -1997,6 +2030,7 @@ async def _register_incident_channels(result: AgentResult) -> None:
                 _ticket_original_descriptions[ticket_id] = ticket.get(
                     "_original_description", ticket.get("description", "")
                 )
+                _ticket_to_channel[ticket_id] = channel_id
             logger.info("Registered incident channel %s", channel_id)
             await emit("ticket_created", {
                 "ticket_id": ticket_id,
@@ -2433,7 +2467,7 @@ async def _open_collaborative_review(
     # Post thread-starting message in #it-helpdesk
     if settings.it_helpdesk_channel_id:
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             review_blocks = format_collaborative_review_blocks(
                 review_id=review_id,
                 trigger_reason=trigger_reason,
@@ -2551,7 +2585,7 @@ async def _gate_recommendations(
     # 6. Post approval request to #it-helpdesk
     if settings.it_helpdesk_channel_id:
         try:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             approval_blocks = format_recommendation_approval_blocks(
                 approval_id, untrusted, response_text, user_name,
             )
@@ -2618,6 +2652,8 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         _conversations[conv_key] = history[-MAX_HISTORY:]
         history = _conversations[conv_key]
 
+    _conversation_last_active[conv_key] = time.time()
+
     try:
         agent = _get_agent(settings)
 
@@ -2638,11 +2674,11 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         await _register_incident_channels(result)
 
         # Post debug reasoning trace (fire-and-forget)
-        asyncio.create_task(_post_debug_summary(
+        _safe_create_task(_post_debug_summary(
             source="dm", user_id=user_id, user_message=text,
             result=result, channel=channel, thread_ts=thread_ts,
             settings=settings,
-        ))
+        ), name="debug_summary_dm")
 
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
@@ -2660,7 +2696,7 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
             if typing_ts:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_update(
                     channel=channel, ts=typing_ts,
                     text=linked_text, blocks=blocks,
@@ -2671,7 +2707,7 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
             # Recommendations were gated — delete the typing indicator
             if typing_ts:
                 try:
-                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    client = _slack_client
                     await client.chat_delete(channel=channel, ts=typing_ts)
                 except Exception:
                     pass
@@ -2680,8 +2716,9 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         await _post_public_article_followups(result, channel, thread_ts, settings)
 
         # Update user profile from conversation (fire-and-forget)
-        asyncio.create_task(
-            _update_user_profile_from_conversation(history, user_id, settings)
+        _safe_create_task(
+            _update_user_profile_from_conversation(history, user_id, settings),
+            name="profile_update_dm",
         )
 
     except Exception as exc:
@@ -2690,7 +2727,7 @@ async def _handle_message(event: dict, text: str, say, settings: Settings) -> No
         # Delete the typing indicator on error
         if typing_ts:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_delete(channel=channel, ts=typing_ts)
             except Exception:
                 pass
@@ -2712,11 +2749,10 @@ def _collect_ticket_history(ticket_id: str) -> list[dict]:
         messages.extend(thread_conv)
 
     # Incident channel history
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            ch_conv = _conversations.get((ch_id, "incident"), [])
-            messages.extend(ch_conv)
-            break
+    inc_ch = _ticket_to_channel.get(ticket_id)
+    if inc_ch:
+        ch_conv = _conversations.get((inc_ch, "incident"), [])
+        messages.extend(ch_conv)
 
     return messages
 
@@ -2738,7 +2774,7 @@ def _schedule_live_summary(ticket_id: str, settings: Settings) -> None:
         finally:
             _summary_timers.pop(ticket_id, None)
 
-    _summary_timers[ticket_id] = asyncio.create_task(_delayed())
+    _summary_timers[ticket_id] = _safe_create_task(_delayed(), name=f"live_summary_{ticket_id}")
 
 
 def _push_live_summary_now(ticket_id: str, settings: Settings) -> None:
@@ -2755,7 +2791,7 @@ def _push_live_summary_now(ticket_id: str, settings: Settings) -> None:
         except Exception:
             logger.exception("Immediate live summary push failed for %s", ticket_id)
 
-    asyncio.create_task(_immediate())
+    _safe_create_task(_immediate(), name=f"live_summary_now_{ticket_id}")
 
 
 async def _push_live_summary(ticket_id: str, settings: Settings) -> None:
@@ -2829,7 +2865,7 @@ async def _handle_incident_message(
     # Ensure we have incident context — fallback to channel name if needed
     if channel not in _incident_context:
         try:
-            slack_client = AsyncWebClient(token=settings.slack_bot_token)
+            slack_client = _slack_client
             info = await slack_client.conversations_info(channel=channel)
             ch_name = info.get("channel", {}).get("name", "")
             ticket_id = _ticket_id_from_channel_name(ch_name)
@@ -2843,6 +2879,7 @@ async def _handle_incident_message(
                     "original_text": None,
                     "summary_lines": [],
                 }
+                _ticket_to_channel[ticket_id] = channel
                 logger.info(
                     "Seeded incident context on-the-fly for %s (%s)", ch_name, ticket_id,
                 )
@@ -2853,7 +2890,7 @@ async def _handle_incident_message(
     if not history:
         # Try to recover previous channel messages (e.g. after restart)
         try:
-            slack_client = AsyncWebClient(token=settings.slack_bot_token)
+            slack_client = _slack_client
             auth = await slack_client.auth_test()
             bot_uid = auth["user_id"]
             resp = await slack_client.conversations_history(channel=channel, limit=MAX_HISTORY)
@@ -2924,6 +2961,8 @@ async def _handle_incident_message(
         _conversations[conv_key] = history[-MAX_HISTORY:]
         history = _conversations[conv_key]
 
+    _conversation_last_active[conv_key] = time.time()
+
     try:
         agent = _get_agent(settings)
 
@@ -2951,12 +2990,12 @@ async def _handle_incident_message(
             ht = _ticket_threads.get(inc_ticket_id)
             if ht:
                 help_thread_ts = ht[1]
-        asyncio.create_task(_post_debug_summary(
+        _safe_create_task(_post_debug_summary(
             source="incident", user_id=user_id, user_message=text,
             result=result, channel=channel, thread_ts=help_thread_ts or None,
             settings=settings, incident_channel_id=channel,
             ticket_id=inc_ticket_id,
-        ))
+        ), name="debug_summary_incident")
 
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
@@ -2974,7 +3013,7 @@ async def _handle_incident_message(
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
             if typing_ts:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_update(
                     channel=channel, ts=typing_ts,
                     text=linked_text, blocks=blocks,
@@ -2985,7 +3024,7 @@ async def _handle_incident_message(
             # Recommendations were gated — delete the typing indicator
             if typing_ts:
                 try:
-                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    client = _slack_client
                     await client.chat_delete(channel=channel, ts=typing_ts)
                 except Exception:
                     pass
@@ -3003,8 +3042,9 @@ async def _handle_incident_message(
         await _post_public_article_followups(result, channel, None, settings)
 
         # Update user profile from conversation (fire-and-forget)
-        asyncio.create_task(
-            _update_user_profile_from_conversation(history, user_id, settings)
+        _safe_create_task(
+            _update_user_profile_from_conversation(history, user_id, settings),
+            name="profile_update_incident",
         )
 
         # Notify #it-helpdesk when escalation happens in an incident channel
@@ -3019,7 +3059,7 @@ async def _handle_incident_message(
                 if not tc_ticket_id:
                     continue
                 try:
-                    escalation_client = AsyncWebClient(token=settings.slack_bot_token)
+                    escalation_client = _slack_client
                     user_display = await _resolve_user_name(user_id, settings)
                     esc_resp = await escalation_client.chat_postMessage(
                         channel=settings.it_helpdesk_channel_id,
@@ -3045,7 +3085,7 @@ async def _handle_incident_message(
         # Delete the typing indicator on error
         if typing_ts:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_delete(channel=channel, ts=typing_ts)
             except Exception:
                 pass
@@ -3092,7 +3132,7 @@ async def _update_incident_summary(
     updated_text = linkify_servicenow_refs(updated_text, settings.sn_instance_url)
 
     try:
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         await client.chat_update(
             channel=channel,
             ts=ctx["summary_ts"],
@@ -3197,13 +3237,14 @@ async def _create_deferred_channel(
         "original_text": None,
         "summary_lines": [],
     }
+    _ticket_to_channel[ticket_id] = channel_id
     await emit("channel_created", {
         "channel_id": channel_id,
         "channel_name": channel_name,
         "ticket_id": ticket_id,
     })
 
-    slack = AsyncWebClient(token=settings.slack_bot_token)
+    slack = _slack_client
 
     # Resolve thread info for permalink
     resolved_thread = thread_info or _ticket_threads.get(ticket_id)
@@ -3461,6 +3502,8 @@ async def _handle_help_channel_message(
         _conversations[conv_key] = history[-MAX_HISTORY:]
         history = _conversations[conv_key]
 
+    _conversation_last_active[conv_key] = time.time()
+
     try:
         agent = _get_agent(settings)
 
@@ -3488,16 +3531,13 @@ async def _handle_help_channel_message(
                 help_ticket_id_dbg = tid
                 break
         if help_ticket_id_dbg:
-            for ch_id, ctx in _incident_context.items():
-                if ctx.get("ticket_id") == help_ticket_id_dbg:
-                    help_inc_channel_dbg = ch_id
-                    break
-        asyncio.create_task(_post_debug_summary(
+            help_inc_channel_dbg = _ticket_to_channel.get(help_ticket_id_dbg, "")
+        _safe_create_task(_post_debug_summary(
             source="help-it", user_id=user_id, user_message=text,
             result=result, channel=channel, thread_ts=thread_ts,
             settings=settings, incident_channel_id=help_inc_channel_dbg,
             ticket_id=help_ticket_id_dbg,
-        ))
+        ), name="debug_summary_helpit")
 
         # Record interaction data
         iid = _interaction_ids.get(conv_key)
@@ -3515,7 +3555,7 @@ async def _handle_help_channel_message(
             linked_text = linkify_servicenow_refs(result.text, sn_url)
             blocks = format_response_blocks(result.text, sn_url)
             if typing_ts:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_update(
                     channel=channel, ts=typing_ts,
                     text=linked_text, blocks=blocks,
@@ -3526,14 +3566,15 @@ async def _handle_help_channel_message(
             # Recommendations were gated — delete the typing indicator
             if typing_ts:
                 try:
-                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    client = _slack_client
                     await client.chat_delete(channel=channel, ts=typing_ts)
                 except Exception:
                     pass
 
         # Update user profile from conversation (fire-and-forget)
-        asyncio.create_task(
-            _update_user_profile_from_conversation(history, user_id, settings)
+        _safe_create_task(
+            _update_user_profile_from_conversation(history, user_id, settings),
+            name="profile_update_helpit",
         )
 
         # ── Post ticket follow-up with "Move to private channel" button ──
@@ -3543,15 +3584,9 @@ async def _handle_help_channel_message(
 
             if ticket_id:
                 # Skip button if a channel was already created (e.g. auto-escalation)
-                already_has_channel = any(
-                    ctx.get("ticket_id") == ticket_id for ctx in _incident_context.values()
-                )
-                if already_has_channel:
+                existing_ch = _ticket_to_channel.get(ticket_id)
+                if existing_ch:
                     # Just post the ticket confirmation without the button
-                    existing_ch = next(
-                        (ch_id for ch_id, ctx in _incident_context.items()
-                         if ctx.get("ticket_id") == ticket_id), None
-                    )
                     followup_text = (
                         f":ticket: *Ticket {ticket_id} created.* "
                         f"A private channel <#{existing_ch}> has been created for this issue."
@@ -3603,7 +3638,7 @@ async def _handle_help_channel_message(
             try:
                 inc_channel = _find_incident_channel_for_thread(channel, thread_ts)
                 if inc_channel:
-                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    slack = _slack_client
                     try:
                         user_info = await slack.users_info(user=user_id)
                         display_name = (
@@ -3646,10 +3681,7 @@ async def _handle_help_channel_message(
             if not tc_ticket_id:
                 continue
             # Check if channel already exists for this ticket
-            already_has_channel = any(
-                ctx.get("ticket_id") == tc_ticket_id for ctx in _incident_context.values()
-            )
-            if already_has_channel:
+            if tc_ticket_id in _ticket_to_channel:
                 continue
             logger.info("Escalation detected: auto-creating channel for %s", tc_ticket_id)
             await _unassign_bot_on_escalation(tc_ticket_id, settings)
@@ -3662,7 +3694,7 @@ async def _handle_help_channel_message(
             if ch_result:
                 ch_id = ch_result["channel_id"]
                 try:
-                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    slack = _slack_client
                     await slack.chat_postMessage(
                         channel=channel,
                         text=(
@@ -3683,11 +3715,7 @@ async def _handle_help_channel_message(
                     fallback_ticket_id = tid
                     break
             if fallback_ticket_id:
-                already_has_channel = any(
-                    ctx.get("ticket_id") == fallback_ticket_id
-                    for ctx in _incident_context.values()
-                )
-                if not already_has_channel:
+                if fallback_ticket_id not in _ticket_to_channel:
                     logger.info(
                         "Keyword escalation fallback: creating channel for %s",
                         fallback_ticket_id,
@@ -3702,7 +3730,7 @@ async def _handle_help_channel_message(
                     if ch_result:
                         ch_id = ch_result["channel_id"]
                         try:
-                            slack = AsyncWebClient(token=settings.slack_bot_token)
+                            slack = _slack_client
                             await slack.chat_postMessage(
                                 channel=channel,
                                 text=(
@@ -3745,7 +3773,7 @@ async def _handle_help_channel_message(
         # Delete the typing indicator on error
         if typing_ts:
             try:
-                client = AsyncWebClient(token=settings.slack_bot_token)
+                client = _slack_client
                 await client.chat_delete(channel=channel, ts=typing_ts)
             except Exception:
                 pass
@@ -3773,7 +3801,7 @@ async def _post_public_article_followups(
             blocks = format_public_article_blocks(articles)
             if blocks:
                 try:
-                    client = AsyncWebClient(token=settings.slack_bot_token)
+                    client = _slack_client
                     kwargs: dict = {"channel": channel, "text": "Public articles", "blocks": blocks}
                     if thread_ts:
                         kwargs["thread_ts"] = thread_ts
@@ -3784,7 +3812,7 @@ async def _post_public_article_followups(
         # Post approval requests for pending articles
         pending = r.get("needs_approval", [])
         if pending and settings.it_helpdesk_channel_id:
-            client = AsyncWebClient(token=settings.slack_bot_token)
+            client = _slack_client
             for item in pending:
                 article = await db.get_public_article(item["article_id"])
                 if not article:
@@ -3818,7 +3846,7 @@ async def post_resolution_update(
     ticket_id: str, ticket_data: dict, settings: Settings
 ) -> None:
     """Post a resolution message to the original #help-it thread and rename the incident channel."""
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
 
     # Post to the original #help-it thread
     thread_info = _ticket_threads.pop(ticket_id, None)
@@ -3862,15 +3890,17 @@ async def post_resolution_update(
     _resolved_pending_close[ticket_id] = time.time()
     logger.info("Ticket %s queued for auto-close in 48h", ticket_id)
 
+    # Clean up resolved ticket's original description from memory
+    _ticket_original_descriptions.pop(ticket_id, None)
+
     # Suggest KB article if this ticket had a collaborative review
-    asyncio.create_task(_suggest_kb_article_for_collab(ticket_id, ticket_data, settings))
+    _safe_create_task(
+        _suggest_kb_article_for_collab(ticket_id, ticket_data, settings),
+        name=f"kb_suggestion_{ticket_id}",
+    )
 
     # Post resolution notice with "Archive Now" button in the incident channel
-    channel_id: str | None = None
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            channel_id = ch_id
-            break
+    channel_id = _ticket_to_channel.get(ticket_id)
 
     if channel_id is not None:
         # Update the escalation message in #it-helpdesk to show resolved status
@@ -3945,12 +3975,8 @@ async def _handle_ticket_assigned(
     """
     await _unassign_bot_on_escalation(ticket_id, settings)
 
-    # Reverse-lookup: find channel_id whose context has this ticket_id
-    channel_id: str | None = None
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            channel_id = ch_id
-            break
+    # Lookup channel_id for this ticket
+    channel_id = _ticket_to_channel.get(ticket_id)
 
     # Auto-create channel if none exists yet (deferred flow / escalation)
     if channel_id is None:
@@ -3966,7 +3992,7 @@ async def _handle_ticket_assigned(
             # Notify the #help-it thread about escalation
             if t_info:
                 try:
-                    slack = AsyncWebClient(token=settings.slack_bot_token)
+                    slack = _slack_client
                     await slack.chat_postMessage(
                         channel=t_info[0],
                         text=(
@@ -3993,7 +4019,7 @@ async def _handle_ticket_assigned(
 
     slack_id = slack_user["slack_id"]
     real_name = slack_user["real_name"]
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
 
     await emit("ticket_assigned", {
         "ticket_id": ticket_id, "assignee_name": real_name, "channel_id": channel_id,
@@ -4041,12 +4067,7 @@ async def _rename_incident_channel_resolved(
     ticket_id: str, client: AsyncWebClient
 ) -> None:
     """Find the incident channel for *ticket_id* and append '-resolved' to its name."""
-    # Reverse-lookup: find channel_id whose context has this ticket_id
-    channel_id: str | None = None
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            channel_id = ch_id
-            break
+    channel_id = _ticket_to_channel.get(ticket_id)
 
     if channel_id is None:
         return
@@ -4063,6 +4084,17 @@ async def _rename_incident_channel_resolved(
         logger.warning("Failed to rename incident channel %s", channel_id, exc_info=True)
 
 
+def _prune_stale_conversations() -> None:
+    """Remove conversation histories older than 24 hours."""
+    cutoff = time.time() - 86400
+    stale = [k for k, t in _conversation_last_active.items() if t < cutoff]
+    for k in stale:
+        _conversations.pop(k, None)
+        _conversation_last_active.pop(k, None)
+    if stale:
+        logger.info("Pruned %d stale conversation(s)", len(stale))
+
+
 async def start_auto_close_loop(settings: Settings) -> None:
     """Background loop that closes resolved tickets after 48 hours and archives their channels."""
     while True:
@@ -4070,6 +4102,10 @@ async def start_auto_close_loop(settings: Settings) -> None:
             await _process_pending_auto_closes(settings)
         except Exception:
             logger.warning("Auto-close loop iteration failed", exc_info=True)
+        try:
+            _prune_stale_conversations()
+        except Exception:
+            logger.warning("Conversation pruning failed", exc_info=True)
         await asyncio.sleep(_AUTO_CLOSE_CHECK_INTERVAL)
 
 
@@ -4085,7 +4121,7 @@ async def _process_pending_auto_closes(settings: Settings) -> None:
 
     logger.info("Auto-closing %d ticket(s) after 48h: %s", len(ready), ", ".join(ready))
 
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
     sn_client = ServiceNowClient(
         settings.sn_instance_url, settings.sn_username, settings.sn_password
     )
@@ -4126,11 +4162,7 @@ async def _auto_close_ticket(
         return  # don't archive if close failed
 
     # 2. Find the incident channel
-    channel_id: str | None = None
-    for ch_id, ctx in _incident_context.items():
-        if ctx.get("ticket_id") == ticket_id:
-            channel_id = ch_id
-            break
+    channel_id = _ticket_to_channel.get(ticket_id)
 
     if channel_id is None:
         return
@@ -4170,6 +4202,7 @@ async def _auto_close_ticket(
     # Clean up tracking
     _incident_channels.discard(channel_id)
     _incident_context.pop(channel_id, None)
+    _ticket_to_channel.pop(ticket_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -4197,7 +4230,7 @@ async def _process_expired_approvals(settings: Settings) -> None:
         return
 
     logger.info("Auto-denying %d expired article approval(s)", len(expired))
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
 
     for article in expired:
         article_id = article["id"]
@@ -4251,7 +4284,7 @@ async def _process_expired_rec_approvals(settings: Settings) -> None:
         return
 
     logger.info("Auto-denying %d expired recommendation approval(s)", len(expired))
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
 
     for approval in expired:
         approval_id = approval["id"]
@@ -4347,7 +4380,7 @@ async def _process_expired_collaborative_reviews(settings: Settings) -> None:
         return
 
     logger.info("Processing %d expired collaborative review(s)", len(expired))
-    client = AsyncWebClient(token=settings.slack_bot_token)
+    client = _slack_client
 
     for review in expired:
         review_id = review["id"]
@@ -4501,7 +4534,7 @@ async def _suggest_kb_article_for_collab(
             suggested_title=suggestion.get("title", "Untitled"),
             key_points=suggestion.get("key_points", []),
         )
-        client = AsyncWebClient(token=settings.slack_bot_token)
+        client = _slack_client
         await client.chat_postMessage(
             channel=settings.it_helpdesk_channel_id,
             thread_ts=helpdesk_ts,

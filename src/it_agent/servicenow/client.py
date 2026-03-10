@@ -71,10 +71,12 @@ class ServiceNowClient:
 
     def __init__(self, instance_url: str, username: str, password: str) -> None:
         self.base_url = f"{instance_url.rstrip('/')}/api/now"
+        transport = httpx.AsyncHTTPTransport(retries=2)
         self._client = httpx.AsyncClient(
             auth=(username, password),
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=30.0,
+            transport=transport,
         )
 
     # --- Incident CRUD ---
