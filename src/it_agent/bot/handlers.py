@@ -3664,6 +3664,19 @@ async def _handle_help_channel_message(
             name="profile_update_helpit",
         )
 
+        # Rename incident channel when agent sets on_hold from a help-it thread
+        for tc in result.tool_calls:
+            if tc["name"] != "update_ticket":
+                continue
+            args = tc.get("args", {})
+            if args.get("status") == "on_hold":
+                tc_ticket_id = args.get("ticket_id", "")
+                if tc_ticket_id:
+                    _safe_create_task(
+                        _rename_incident_channel_on_hold(tc_ticket_id, _slack_client),
+                        name=f"rename_onhold_{tc_ticket_id}",
+                    )
+
         # Track awaiting-user-response for on_hold timer
         for _tid, (_ch, _ts) in _ticket_threads.items():
             if _ch == channel and _ts == thread_ts:
